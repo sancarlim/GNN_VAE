@@ -173,5 +173,5 @@ models/VAE_GNN.py
 events*
 sweep.yaml
 core
-.tar
-.tar.gz
+*.tar
+*.tar.gz
