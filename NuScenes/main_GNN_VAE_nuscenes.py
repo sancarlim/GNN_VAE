@@ -6,10 +6,9 @@ import torch.nn.functional as F
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 import sys
-sys.path.append('../../DBU_Graph')
+sys.path.append('..')
 import numpy as np
 from nuscenes_Dataset import nuscenes_Dataset, collate_batch
-from nuscenes_visualize import collate_batch as collate_batch_test
 from models.VAE_PRIOR import VAE_GNN_prior
 from models.VAE_GNN import VAE_GNN
 from models.VAE_GATED import VAE_GATED
@@ -34,16 +33,32 @@ history_frames = history*FREQUENCY
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames #2s of history + 6s of prediction
 input_dim_model = (history_frames-1)*8 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
-output_dim = future_frames*3
+output_dim = future_frames*2
 
 
+def collate_batch_test(samples):
+    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
+    masks = torch.vstack(masks)
+    feats = torch.vstack(feats)
+    gt = torch.vstack(gt).float()
+    if maps[0] is not None:
+        maps = torch.vstack(maps)
+    sizes_n = [graph.number_of_nodes() for graph in graphs] # graph sizes
+    snorm_n = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_n]
+    snorm_n = torch.cat(snorm_n).sqrt()  # graph size normalization 
+    sizes_e = [graph.number_of_edges() for graph in graphs] # nb of edges
+    snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
+    snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
+    batched_graph = dgl.batch(graphs)  # batch graphs
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps
 
 
 class LitGNN(pl.LightningModule):
-    def __init__(self, model,  train_dataset, val_dataset, test_dataset, history_frames: int=3, future_frames: int=3, 
-                    lr1: float = 1e-3, lr2: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1., 
+    def __init__(self, model = None,  train_dataset = None, val_dataset = None, test_dataset = None, history_frames: int=3, future_frames: int=3, 
+                    lr1: float = 1e-3, lr2: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, delta: float = 1., 
                     rel_types: bool = False, scale_factor: int = 1, wandb : bool = True, decay_rate: float = 0.96, 
-                    reconstruction_loss: str = 'huber', beta_p: float = 1, gamma: float = 0.01):
+                    reconstruction_loss: str = 'huber',  gamma: float = 0.01, beta_period: float = 4, beta_ratio_annealing: float = 0.5,
+                    beta_max_value: float = 1, model_type: str = 'vae_gat'):
         super().__init__()
         self.model= model
         self.lr1 = lr1
@@ -53,8 +68,6 @@ class LitGNN(pl.LightningModule):
         self.history_frames =history_frames
         self.future_frames = future_frames
         self.total_frames = history_frames + future_frames
-        self.beta = 0 #beta
-        self.beta_p = beta_p
         self.gamma = gamma
         self.delta = delta
         self.overall_loss_time_list=[]
@@ -69,7 +82,11 @@ class LitGNN(pl.LightningModule):
         self.wandb = wandb
         self.decay_rate = decay_rate
         self.reconstruction_loss = reconstruction_loss
-        
+        self.beta = 0
+        self.beta_period = beta_period
+        self.beta_ratio_annealing = beta_ratio_annealing
+        self.beta_max_value = beta_max_value
+        self.model_type = model_type
         
     
     def forward(self, graph, feats,e_w,snorm_n,snorm_e):
@@ -166,10 +183,10 @@ class LitGNN(pl.LightningModule):
                 z0_loss = error
         '''
         if self.global_step > 1:
-            self.frange_cycle_linear()
+            self.frange_cycle_linear(stop=self.beta_max_value, ratio=self.beta_ratio_annealing, period=self.batch_size*self.beta_period)
 
         loss = recons_loss + self.beta * kld_loss.mean() + self.beta * kld_prior.mean() #+ self.gamma * z0_loss
-        return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KL':self.beta *kld_loss.mean(), 'KL_prior': self.beta *kld_prior.mean(),  'beta': self.beta} #'z0': self.gamma *z0_loss,}
+        return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KL': kld_loss.mean(), 'KL_prior':  kld_prior.mean(),  'beta': self.beta} #'z0': self.gamma *z0_loss,}
   
       
     def vae_loss(self, pred, gt, mask, mu, log_var):
@@ -185,7 +202,7 @@ class LitGNN(pl.LightningModule):
         kld_loss = kl_divergence(
         Normal(mu, std), Normal(torch.zeros_like(mu), torch.ones_like(std))
         ).sum(-1)
-        
+        '''
         # Supervise z0 as heading
         heading = (gt[:,:,2:]*mask).squeeze()
         z_sample = torch.distributions.Normal(mu, std).sample_n(3)[:,:,0]
@@ -194,9 +211,12 @@ class LitGNN(pl.LightningModule):
             diff = ((heading[:,-1]-z)**2).sum()/overall_num.sum(dim=0)[-1] 
             if diff < z0_loss:
                 z0_loss = diff
-        
-        loss = recons_loss + self.beta * kld_loss.mean() + self.gamma * z0_loss
-        return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KL':kld_loss, 'z0': z0_loss}
+        '''
+        if self.global_step > 1:
+            self.frange_cycle_linear(stop=self.beta_max_value, ratio=self.beta_ratio_annealing, period=self.batch_size*self.beta_period)
+
+        loss = recons_loss + self.beta * kld_loss.mean() #+ self.gamma * z0_loss
+        return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KL': kld_loss.mean(),  'beta': self.beta}#, 'z0': z0_loss}
 
     
     def training_step(self, train_batch, batch_idx):
@@ -204,18 +224,21 @@ class LitGNN(pl.LightningModule):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps = train_batch
         feats_vel, labels_vel = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
         feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
-        labels = torch.cat([labels_vel, labels_pos[:,:,2:]], dim=-1)
+        #labels = torch.cat([labels_vel, labels_pos[:,:,2:]], dim=-1)
         e_w = batched_graph.edata['w'].float()
         if not self.rel_types:
             e_w= e_w.unsqueeze(1)
         if maps.shape[0] != feats.shape[0]:
             print('stop')
-        pred, mu, log_var, mu_prior, log_var_prior, z0 = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels, maps)
-        #pred, mu, log_var=self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels[:,:,:2], maps)
-        pred=pred.view(labels.shape[0],self.future_frames,-1)
         
-        #total_loss, logs = self.vae_loss(pred,  labels, output_masks, mu, log_var)
-        total_loss, logs = self.vae_loss_prior(pred, labels, output_masks, mu, log_var, mu_prior, log_var_prior,z0)
+        if self.model_type == 'vae_prior':
+            pred, mu, log_var, mu_prior, log_var_prior, z0 = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
+            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            total_loss, logs = self.vae_loss_prior(pred, labels_vel, output_masks, mu, log_var, mu_prior, log_var_prior,z0)
+        else:
+            pred, mu, log_var=self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
+            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            total_loss, logs = self.vae_loss(pred,  labels_vel, output_masks, mu, log_var)
 
         self.log_dict({f"Sweep/train_{k}": v for k,v in logs.items()}, on_step=True, on_epoch=False)
         return total_loss
@@ -234,12 +257,14 @@ class LitGNN(pl.LightningModule):
         if not self.rel_types:
             e_w= e_w.unsqueeze(1)
         
-        pred, mu, log_var, mu_prior, log_var_prior, z0 = self.model(batched_graph, feats,e_w,snorm_n,snorm_e,labels, maps)
-        #pred, mu, log_var = self.model(batched_graph, feats,e_w,snorm_n,snorm_e,labels[:,:,:2], maps)
-        pred=pred.view(labels.shape[0],self.future_frames,-1)
-        
-        total_loss, logs = self.vae_loss_prior(pred, labels, output_masks, mu, log_var, mu_prior, log_var_prior, z0)
-        #total_loss, logs = self.vae_loss(pred, labels, output_masks, mu, log_var)
+        if self.model_type == 'vae_prior':
+            pred, mu, log_var, mu_prior, log_var_prior, z0 = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
+            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            total_loss, logs = self.vae_loss_prior(pred, labels_vel, output_masks, mu, log_var, mu_prior, log_var_prior,z0)
+        else:
+            pred, mu, log_var=self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
+            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            total_loss, logs = self.vae_loss(pred,  labels_vel, output_masks, mu, log_var)
         
         self.log_dict({f"Sweep/val_{k}": v for k,v in logs.items()})
         #self.log_dict({"Sweep/val_loss": logs['loss'], "Sweep/val_reconstruction": logs['Reconstruction_Loss']/self.future_frames, "Sweep/Val_KL": logs['KL']})
@@ -255,17 +280,13 @@ class LitGNN(pl.LightningModule):
          
     def test_step(self, test_batch, batch_idx):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps  = test_batch
-        
         last_loc = feats[:,-1:,:2].detach().clone() 
-
         rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
-        
         feats_vel, labels = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
         feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
-        
         if self.scale_factor == 1:
-            pass#last_loc = last_loc*12.4354+0.1579
+            pass#last_loc = last_loc*5.398+0.0013
         else:
             last_loc = last_loc*rescale_xy      
         e_w = batched_graph.edata['w'].float()
@@ -278,8 +299,11 @@ class LitGNN(pl.LightningModule):
         #Para el most-likely coger el modo con pi mayor de los 3 y o bien coger muestra de la media 
         for i in range(5): # @top10 Saco el min ADE/FDE por escenario tomando 15 muestras (15 escenarios)
             #Model predicts relative_positions
-            preds, mu, logvar = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps)   #,mu,logvar
-            preds=preds.view(preds.shape[0],self.future_frames,-1)
+            if self.model_type == 'vae_prior':
+                preds, mu, logvar = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps)   
+            else:
+                preds = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps) 
+            preds=preds.view(preds.shape[0],self.future_frames,-1)[:,:,:2]
             #Convert prediction to absolute positions
             for j in range(1,labels_pos.shape[1]):
                 preds[:,j,:] = torch.sum(preds[:,j-1:j+1,:],dim=-2) #6,2 
@@ -308,7 +332,7 @@ def main(args: Namespace):
 
     train_dataset = nuscenes_Dataset(train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames) #3447
     val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames)  #919
-    test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #230
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #230
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout, 
@@ -321,13 +345,16 @@ def main(args: Namespace):
         model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
                         attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'))
-
-    LitGNN_sys = LitGNN(model=model, lr1=args.lr1, lr2=args.lr2,  wd=args.wd, history_frames=history_frames, future_frames= future_frames, beta = args.beta, delta=args.delta,
-    train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, wandb= not args.nowandb,
-    decay_rate=args.decay_rate, reconstruction_loss=args.reconstruction_loss, beta_p = args.beta_p, gamma=args.gamma, batch_size=args.batch_size)
+    '''
+    LitGNN_sys = LitGNN(model=model, lr1 = args.lr1, lr2 = args.lr2,  wd = args.wd, history_frames = history_frames, future_frames = future_frames, delta = args.delta,
+    train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, rel_types = args.ew_dims>1, scale_factor = args.scale_factor, wandb = not args.nowandb,
+    decay_rate = args.decay_rate, reconstruction_loss = args.reconstruction_loss, gamma = args.gamma, batch_size = args.batch_size, beta_period = args.beta_period, 
+    beta_ratio_annealing = args.beta_ratio_annealing, beta_max_value = args.beta_max_value, model_type = args.model_type)
+    '''
+    LitGNN_sys = LitGNN(model=model, train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, 
+                        history_frames = history_frames, future_frames = future_frames, **args)
     
-    
-    early_stop_callback = EarlyStopping('Sweep/val_Reconstruction_Loss', patience=6)
+    early_stop_callback = EarlyStopping('Sweep/val_Reconstruction_Loss', patience=10)
 
     if not args.nowandb:
         run=wandb.init(job_type="training", entity='sandracl72', project='nuscenes')  
@@ -343,11 +370,11 @@ def main(args: Namespace):
     else:
         checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_loss', mode='min', dirpath='/media/14TBDISK/sandra/logs/',filename='nowandb-{epoch:02d}')
         trainer = pl.Trainer( weights_summary='full', gpus=args.gpus, deterministic=True, precision=16, callbacks=[early_stop_callback,checkpoint_callback], profiler=True) 
-
     
     if args.ckpt is not None:
         LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
-                     train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor)
+                     train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
+                     model_type=args.model_type)
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler=True)
         trainer.test(LitGNN_sys)
@@ -372,7 +399,7 @@ if __name__ == '__main__':
     parser.add_argument("--wd", type=float, default=0.01, help="Adam: weight decay")
     parser.add_argument("--batch_size", type=int, default=128, help="Size of the batches")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=768)
+    parser.add_argument("--hidden_dims", type=int, default=64)
     parser.add_argument("--model_type", type=str, default='vae_prior', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'vae_prior'])
     parser.add_argument("--reconstruction_loss", type=str, default='huber', help="Choose reconstruction loss.",
@@ -385,8 +412,11 @@ if __name__ == '__main__':
     parser.add_argument("--feat_drop", type=float, default=0.)
     parser.add_argument("--attn_drop", type=float, default=0.25)
     parser.add_argument("--heads", type=int, default=2, help='Attention heads (GAT)')
-    parser.add_argument("--beta", type=float, default=1, help='Weighting factor of the KL divergence loss term')
-    parser.add_argument("--beta_p", type=float, default=1, help='Weighting factor of the KL divergence loss term for the prior')
+    parser.add_argument("--beta_period", type=float, default=4, help='Period of the cyclical annealing: period = batch_size*args.period')
+    parser.add_argument("--beta_ratio_annealing", type=float, default=0.7)
+    parser.add_argument("--beta_max_value", type=float, default=1, help='Max value of beta.')
+    #parser.add_argument("--beta", type=float, default=1, help='Weighting factor of the KL divergence loss term')
+    #parser.add_argument("--beta_p", type=float, default=1, help='Weighting factor of the KL divergence loss term for the prior')
     parser.add_argument("--gamma", type=float, default=0.01, help='Weighting factor of the z0 supervision loss')
     parser.add_argument("--delta", type=float, default=.001, help='Delta factor in Huber Loss (Reconstruction Loss)')
     #parser.add_argument('--att_ew', action='store_true', help='use this flag to add edge features in attention function (GAT)')    
