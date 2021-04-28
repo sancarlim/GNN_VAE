@@ -45,7 +45,7 @@ def compute_change_pos(feats,gt, scale_factor):
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
     #if scale_factor==1:
-    #    gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:]*12.4354+0.1579)) * new_mask_gt[:,0:1]
+    #    gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:]*5.398+0.0013)) * new_mask_gt[:,0:1]
     #else:
     rescale_xy=torch.ones((1,1,2), device=feats.device)*scale_factor
     gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]*rescale_xy) * new_mask_gt[:,0:1]

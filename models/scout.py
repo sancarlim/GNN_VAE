@@ -205,12 +205,14 @@ class SCOUT(nn.Module):
     
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, bn=False, gn=False, 
                 feat_drop=0., attn_drop=0., heads=1,att_ew=False, res_weight=True, 
-                res_connection=True, ew_type=False,  backbone='mobilenet', freeze=0):
+                res_connection=True, ew_dims=False,  backbone='mobilenet', freeze=0):
         super().__init__()
 
         self.heads = heads
         self.bn = bn
         self.gn = gn
+        self.hidden_dim = hidden_dim
+        self.ew_dims = ew_dims
         self.embedding_h = nn.Linear(input_dim, hidden_dim)###//2)
 
         #self.embedding_h = nn.Sequential(
@@ -345,11 +347,17 @@ class SCOUT(nn.Module):
             h = self.group_norm(h)
 
         # GAT Layers
-        e=self.resize_e(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1)
+        if self.ew_dims > 1:
+            e = self.resize_e(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e(e_w)
+        else:
+            e = torch.ones((1, self.hidden_dim), device=h.device) * e_w
         g.edata['w']=e
         h = self.gat_1(g, h,snorm_n) 
         if self.heads > 1:
-            e = self.resize_e2(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1)   #self.embedding_e2(e_w)
+            if self.ew_dims > 1:
+                e = self.resize_e2(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e2(e_w)
+            else:
+                e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
             g.edata['w']=e
         h = self.gat_2(g, h, snorm_n)  #BN Y RELU DENTRO DE LA GAT_LAYER
         h = self.dropout_l(h)
@@ -368,7 +376,7 @@ if __name__ == '__main__':
 
     hidden_dims = round(hidden_dims / heads) 
     model = SCOUT(input_dim=input_dim, hidden_dim=hidden_dims, output_dim=output_dim, heads=heads, 
-                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, ew_type=True, backbone='resnet', freeze=True)
+                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, ew_dims=True, backbone='resnet', freeze=True)
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
     print(model.feature_extractor)
     test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 

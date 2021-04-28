@@ -334,9 +334,19 @@ def main(args: Namespace):
     val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames)  #919
     test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #230
 
+    '''
+    if args.ckpt is not None:
+        hparams = torch.load(args.ckpt)['hyper_parameters']
+        ckpt = args.ckpt
+        args = hparams['hparams']
+        test = True
+    LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=ckpt, hparams = args, model=model, test_dataset = hparams['test_dataset'], 
+                        history_frames = hparams['history_frames'], future_frames = hparams['future_frames'])
+    '''
+
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout, 
-                             ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze)
+                            ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze)
     elif args.model_type == 'vae_prior':
         model = VAE_GNN_prior(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
                         attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
@@ -345,14 +355,15 @@ def main(args: Namespace):
         model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
                         attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'))
-    '''
+    
+
+    
+    
     LitGNN_sys = LitGNN(model=model, lr1 = args.lr1, lr2 = args.lr2,  wd = args.wd, history_frames = history_frames, future_frames = future_frames, delta = args.delta,
     train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, rel_types = args.ew_dims>1, scale_factor = args.scale_factor, wandb = not args.nowandb,
     decay_rate = args.decay_rate, reconstruction_loss = args.reconstruction_loss, gamma = args.gamma, batch_size = args.batch_size, beta_period = args.beta_period, 
     beta_ratio_annealing = args.beta_ratio_annealing, beta_max_value = args.beta_max_value, model_type = args.model_type)
-    '''
-    LitGNN_sys = LitGNN(model=model, train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, 
-                        history_frames = history_frames, future_frames = future_frames, **args)
+    
     
     early_stop_callback = EarlyStopping('Sweep/val_Reconstruction_Loss', patience=10)
 
@@ -370,15 +381,16 @@ def main(args: Namespace):
     else:
         checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_loss', mode='min', dirpath='/media/14TBDISK/sandra/logs/',filename='nowandb-{epoch:02d}')
         trainer = pl.Trainer( weights_summary='full', gpus=args.gpus, deterministic=True, precision=16, callbacks=[early_stop_callback,checkpoint_callback], profiler=True) 
-    
+
     if args.ckpt is not None:
         LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
-                     train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
-                     model_type=args.model_type)
+                    train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
+                    model_type=args.model_type)
+
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler=True)
         trainer.test(LitGNN_sys)
-    else:
+    else:        
         print('GPU Nº: ', device)
         print("############### TRAIN ####################")
         trainer.fit(LitGNN_sys)
@@ -399,7 +411,7 @@ if __name__ == '__main__':
     parser.add_argument("--wd", type=float, default=0.01, help="Adam: weight decay")
     parser.add_argument("--batch_size", type=int, default=128, help="Size of the batches")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=64)
+    parser.add_argument("--hidden_dims", type=int, default=256)
     parser.add_argument("--model_type", type=str, default='vae_prior', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'vae_prior'])
     parser.add_argument("--reconstruction_loss", type=str, default='huber', help="Choose reconstruction loss.",

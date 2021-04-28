@@ -9,6 +9,7 @@ os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 from nuscenes_Dataset import nuscenes_Dataset
 from models.VAE_GNN import VAE_GNN
+from models.VAE_PRIOR import VAE_GNN_prior
 from models.scout import SCOUT
 #from VAE_GATED import VAE_GATED
 import pytorch_lightning as pl
@@ -39,7 +40,7 @@ future = 6
 history_frames = history*FREQUENCY
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames #2s of history + 6s of prediction
-input_dim_model = (history_frames-1)*9 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
+input_dim_model = (history_frames-1)*8 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2
 base_path='/media/14TBDISK/sandra/nuscenes_processed'
 DATAROOT = '/media/14TBDISK/nuscenes'
@@ -94,7 +95,7 @@ def collate_batch(samples):
 class LitGNN(pl.LightningModule):
     def __init__(self, model, model_type, train_dataset, val_dataset, test_dataset, history_frames: int=3, future_frames: int=3, lr: float = 1e-3, 
                     batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1., rel_types: bool = False, 
-                    scale_factor=1, scene_id : int = 927):
+                    scale_factor=1, scene_id : int = 927, sample : str = None):
         super().__init__()
         self.model= model
         self.history_frames =history_frames
@@ -105,7 +106,7 @@ class LitGNN(pl.LightningModule):
         self.scale_factor = scale_factor
         self.scene_id = scene_id
         self.model_type = model_type
-        
+        self.sample = sample
     
     def forward(self, graph, feats,e_w,snorm_n,snorm_e):
         # in lightning, forward defines the prediction/inference actions
@@ -128,7 +129,9 @@ class LitGNN(pl.LightningModule):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps = test_batch
         if scene_id != self.scene_id:
             return 
-        
+        sample_token = tokens_eval[0][1]
+        if self.sample is not None and  sample_token != self.sample:
+            return
         print(tokens_eval)
         
         rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
@@ -150,7 +153,10 @@ class LitGNN(pl.LightningModule):
         prediction_all_agents = []  # [num_agents, num_modes, n_timesteps, state_dim]
         for i in range(25):
             #Model predicts relative_positions
-            preds = self.model.inference(batched_graph, feats_local,e_w,snorm_n,snorm_e,maps)  # [N_agents, 12, 2]
+            if self.model_type == 'vae_prior':
+                preds, mu, logvar = self.model.inference(batched_graph, feats_local,e_w,snorm_n,snorm_e,maps)  # [N_agents, 12, 2]
+            else:
+                preds = self.model.inference(batched_graph, feats_local,e_w,snorm_n,snorm_e,maps)
             preds=preds.view(preds.shape[0],self.future_frames,-1)  
             #Convert prediction to absolute positions
             for j in range(1,labels_pos.shape[1]):
@@ -167,7 +173,6 @@ class LitGNN(pl.LightningModule):
         
         #VISUALIZE SEQUENCE
         #Get Scene from sample token ie current frame
-        sample_token = tokens_eval[0][1]
         scene=nuscenes.get('scene', nuscenes.get('sample',sample_token)['scene_token'])
         scene_name = scene['name']
         scene_id = int(scene_name.replace('scene-', ''))
@@ -264,6 +269,7 @@ class LitGNN(pl.LightningModule):
 
             else:  
                 if 'parked' not in attribute:
+                    '''
                     if self.model_type == 'scout':
                         ax.plot(prediction[0, :, 0], prediction[0, :, 1], 'mo-',
                                 zorder=620,
@@ -273,20 +279,21 @@ class LitGNN(pl.LightningModule):
                         for t in range(prediction.shape[1]):
                             try:
                                 sns.kdeplot(x=prediction[:,t,0], y=prediction[:,t,1],
-                                    ax=ax, shade=True, thresh=0.05, 
-                                    color=line_colors[i % len(line_colors)], zorder=600, alpha=1)
+                                    ax=ax, thresh=0.05, shade=True,
+                                    color=line_colors[i % len(line_colors)], zorder=600, alpha=1)  #shade True
                             except:
                                 print('2-th leading minor of the array is not positive definite')
                                 continue
-                    
                     '''
+                    
                     #Plot 25 predictions (modes)
                     for sample_num in range(prediction.shape[0]):
-                        ax.plot(predictions[sample_num, :, 0], predictions[sample_num, :, 1], 'ko-',
+                        ax.plot(prediction[sample_num, :, 0], prediction[sample_num, :, 1], 'ko-',
                                 zorder=620,
+                                color=line_colors[i % len(line_colors)],
                                 markersize=5,
                                 linewidth=3, alpha=0.7)
-                    '''
+                    
 
                 
                 r_img = rotate(cars[i % len(cars)], quaternion_yaw(Quaternion(annotation['rotation']))*180/math.pi,reshape=True)
@@ -321,7 +328,7 @@ class LitGNN(pl.LightningModule):
             ax.add_artist(circle)
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + '_HalfNormal_' + self.model_type + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + self.model_type + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
         print('Image saved in: ', os.path.join(base_path, 'visualizations' , scene_name + '_' + sample_token + '.jpg'))
    
 def main(args: Namespace):
@@ -341,6 +348,10 @@ def main(args: Namespace):
         hidden_dims = round(args.hidden_dims // args.heads)
         model = SCOUT(input_dim=input_dim_model, hidden_dim=hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_type=args.ew_dims>1, backbone=args.backbone)
+    elif args.model_type == 'vae_prior':
+        model = VAE_GNN_prior(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
+                        attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
+                        bn=(args.norm=='bn'), gn=(args.norm=='gn'))
     
 
     LitGNN_sys = LitGNN(model=model,  model_type = args.model_type,history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
@@ -349,7 +360,7 @@ def main(args: Namespace):
     trainer = pl.Trainer(gpus=1, deterministic=True,  profiler=True) 
  
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
-                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id)
+                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
 
     
     trainer.test(LitGNN_sys)
@@ -360,10 +371,10 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
-    parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
+    parser.add_argument("--ew_dims", type=int, default=1, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=768)
-    parser.add_argument("--model_type", type=str, default='vae_gat', help="Choose aggregation function between GAT or GATED",
+    parser.add_argument("--hidden_dims", type=int, default=256)
+    parser.add_argument("--model_type", type=str, default='vae_prior', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'scout'])
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--feat_drop", type=float, default=0.)
@@ -372,11 +383,14 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default='/media/14TBDISK/sandra/logs/NuScenes VAE/dark-deluge-1630/epoch=22-step=3081.ckpt', help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true')
+    parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
+    parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN (bn) or GroupNorm (gn).")
 
     parser.add_argument('--maps', type=str2bool, nargs='?', const=True, default=True, help="Add HD Maps.")
     parser.add_argument("--backbone", type=str, default='resnet', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'mobilenet', 'resnet18', 'map_encoder'])
-    parser.add_argument("--scene_id", type=int, default=103, help="Scene id to visualize.")
+    parser.add_argument("--scene_id", type=int, default=36, help="Scene id to visualize.")
+    parser.add_argument("--sample", type=str, default=None, help="sample to visualize.")
     
     hparams = parser.parse_args()
 

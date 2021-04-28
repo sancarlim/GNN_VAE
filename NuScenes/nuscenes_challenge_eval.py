@@ -10,6 +10,8 @@ import numpy as np
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset
 from models.VAE_GNN import VAE_GNN
 from models.VAE_GATED import VAE_GATED
+from models.scout import SCOUT
+from models.VAE_PRIOR import VAE_GNN_prior
 import wandb
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
@@ -27,14 +29,16 @@ future = 6
 history_frames = history*FREQUENCY
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames #2s of history + 6s of prediction
-input_dim_model = (history_frames-1)*9 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
+input_dim_model = (history_frames-1)*8 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2
 base_path = '/home/sandra/PROGRAMAS/DBU_Graph/NuScenes'
 
 
 
 class LitGNN(pl.LightningModule):
-    def __init__(self, model,  train_dataset, val_dataset, test_dataset, history_frames: int=3, future_frames: int=3, lr: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1., rel_types: bool = False, scale_factor=1):
+    def __init__(self, model,  train_dataset, val_dataset, test_dataset, model_type, history_frames: int=3, future_frames: int=3, 
+                 lr: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1.,
+                 rel_types: bool = False, scale_factor=1):
         super().__init__()
         self.model= model
         self.history_frames =history_frames
@@ -43,6 +47,7 @@ class LitGNN(pl.LightningModule):
         self.test_dataset = test_dataset
         self.rel_types = rel_types
         self.scale_factor = scale_factor
+        self.model_type = model_type
         self.challenge_predictions = []
         f = open('/media/14TBDISK/nuscenes/maps/prediction/prediction_scenes.json')
         self.prediction_scenes = json.load(f)  #Dict with keys "scene_id" : list("instances_samples")
@@ -80,29 +85,52 @@ class LitGNN(pl.LightningModule):
         
         # Prediction: Prediction of model [num_modes, n_timesteps, state_dim] = [25, 12, 2]
         prediction_all_agents = []  # [num_agents, num_modes, n_timesteps, state_dim]
-        for i in range(25):
-            #Model predicts relative_positions
-            preds = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps)  # [N_agents, 12, 2]
-            preds=preds.view(preds.shape[0],self.future_frames,-1)  
-            #Convert prediction to absolute positions
-            for j in range(1,labels_pos.shape[1]):
-                preds[:,j,:] = torch.sum(preds[:,j-1:j+1,:],dim=-2) #6,2 
+        if self.model_type == 'scout':
+            preds = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
+            preds=preds.view(preds.shape[0],labels_pos.shape[1],-1)
+
+            for i in range(1,labels_pos.shape[1]):
+                preds[:,i,:] = torch.sum(preds[:,i-1:i+1,:],dim=-2) #BV,6,2 
             preds += last_loc
 
             # Provide predictions in global-coordinates
             pred_x = preds[:,:,0].cpu().numpy() + mean_xy[0][0]  # [N_agents, T]
             pred_y = preds[:,:,1].cpu().numpy() + mean_xy[0][1]
             
-            prediction_all_agents.append(np.stack([pred_x, pred_y],axis=-1))
+            prediction_all_agents = np.expand_dims(np.stack([pred_x, pred_y],axis=-1), axis=0)
 
-        prediction_all_agents = np.array(prediction_all_agents)
-        for token in tokens_eval:
-            if str(token[0]+'_'+token[1]) in self.prediction_scenes['scene-'+ str(scene_id).zfill(4)]:
-                idx = np.where(np.array(tokens_eval)== token[0])[0][0]
-                instance, sample = token
-                pred = Prediction(str(instance), str(sample), prediction_all_agents[:,idx], np.ones(25)*1/25)  #need the pred to have 2d
-                self.challenge_predictions.append(pred.serialize())
-    
+            for token in tokens_eval:
+                if str(token[0]+'_'+token[1]) in self.prediction_scenes['scene-'+ str(scene_id).zfill(4)]:
+                    idx = np.where(np.array(tokens_eval)== token[0])[0][0]
+                    instance, sample = token
+                    pred = Prediction(str(instance), str(sample), prediction_all_agents[:,idx], np.ones(1))  #need the pred to have 2d
+                    self.challenge_predictions.append(pred.serialize())
+
+
+        else:
+            for i in range(25):
+                #Model predicts relative_positions
+                preds = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps)  # [N_agents, 12, 2]
+                preds=preds.view(preds.shape[0],self.future_frames,-1)  
+                #Convert prediction to absolute positions
+                for j in range(1,labels_pos.shape[1]):
+                    preds[:,j,:] = torch.sum(preds[:,j-1:j+1,:],dim=-2) #6,2 
+                preds += last_loc
+
+                # Provide predictions in global-coordinates
+                pred_x = preds[:,:,0].cpu().numpy() + mean_xy[0][0]  # [N_agents, T]
+                pred_y = preds[:,:,1].cpu().numpy() + mean_xy[0][1]
+                
+                prediction_all_agents.append(np.stack([pred_x, pred_y],axis=-1))
+
+                prediction_all_agents = np.array(prediction_all_agents)
+                for token in tokens_eval:
+                    if str(token[0]+'_'+token[1]) in self.prediction_scenes['scene-'+ str(scene_id).zfill(4)]:
+                        idx = np.where(np.array(tokens_eval)== token[0])[0][0]
+                        instance, sample = token
+                        pred = Prediction(str(instance), str(sample), prediction_all_agents[:,idx], np.ones(25)*1/25)  #need the pred to have 2d
+                        self.challenge_predictions.append(pred.serialize())
+            
     def test_epoch_end(self, outputs):
         json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference.json'),'w'))
 
@@ -117,17 +145,26 @@ def main(args: Namespace):
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
+    elif args.model_type == 'vae_prior':
+        model = VAE_GNN_prior(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
+                        attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
+                        bn=(args.norm=='bn'), gn=(args.norm=='gn'))
+    elif args.model_type == 'scout':
+        hidden_dims = round(args.hidden_dims // args.heads)
+        model = SCOUT(input_dim=input_dim_model, hidden_dim=hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
+                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone, freeze=args.freeze)
     else:
         model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, 
                         ew_dims=args.ew_dims, backbone=args.backbone)
     LitGNN_sys = LitGNN(model=model, history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
-                 test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor)
+                 test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, model_type = args.model_type)
       
     trainer = pl.Trainer(gpus=args.gpus, deterministic=True, precision=16, profiler=True) 
  
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
-                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor)
+                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor,
+                    model_type = args.model_type)
 
     
     trainer.test(LitGNN_sys)
@@ -138,11 +175,13 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
-    parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
+    parser.add_argument("--ew_dims", type=int, default=1, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
     parser.add_argument("--hidden_dims", type=int, default=768)
-    parser.add_argument("--model_type", type=str, default='vae_gat', help="Choose aggregation function between GAT or GATED",
-                                        choices=['vae_gat', 'vae_gated'])
+    parser.add_argument("--model_type", type=str, default='scout', help="Choose aggregation function between GAT or GATED",
+                                        choices=['vae_gat', 'vae_gated', 'vae_prior','scout'])
+    parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
+    parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN (bn) or GroupNorm (gn).")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--feat_drop", type=float, default=0.)
     parser.add_argument("--attn_drop", type=float, default=0.4)

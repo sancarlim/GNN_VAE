@@ -6,10 +6,10 @@ import os
 os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 import matplotlib.pyplot as plt
-from torchvision.models import resnet18
+from torchvision.models import resnet18, resnet50
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
 from torch.utils.data import DataLoader
-from models.MapEncoder import My_MapEncoder
+from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
 from models.scout import My_GATLayer, MultiHeadGATLayer
 from models.VAE_GNN import GAT_VAE
 from torchsummary import summary
@@ -36,6 +36,7 @@ class MLP_Enc(nn.Module):
     def forward(self, h):
         h = self.dropout_l(h)
         h = F.leaky_relu(self.linear(h))
+        h = self.dropout_l(h)
         log_var = self.log_var(h) 
         mu = self.mu(h)
         return mu, log_var
@@ -47,26 +48,24 @@ class MLP_Dec(nn.Module):
         self.in_dim = in_dim
         self.hid_dim = hid_dim
         self.dropout = nn.Dropout(dropout)
-        self.linear0 = nn.Linear(in_dim, output_dim)
-        #self.linear1 = nn.Linear(hid_dim, output_dim) 
+        self.linear0 = nn.Linear(in_dim, hid_dim)
+        self.linear1 = nn.Linear(hid_dim, output_dim) 
 
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
-        nn.init.xavier_normal_(self.linear0.weight)
-        #nn.init.kaiming_normal_(self.linear0.weight, a=0.02, nonlinearity='leaky_relu')
+        nn.init.xavier_normal_(self.linear1.weight)
+        nn.init.kaiming_normal_(self.linear0.weight, a=0.02, nonlinearity='leaky_relu')
 
     def forward(self, h):
         h = self.dropout(h)
-        #h = F.leaky_relu(self.linear0(h), negative_slope=0.02)
-        #h = self.dropout(h) 
-        y = self.linear0(h)
+        h = F.leaky_relu(self.linear0(h), negative_slope=0.02)
+        h = self.dropout(h) 
+        y = self.linear1(h)
         return y
 
-    
 
-    
 class VAE_GNN_prior(nn.Module):
-    def __init__(self, input_dim, hidden_dim, z_dim, output_dim, fc=False, dropout=0.2, feat_drop=0., 
+    def __init__(self, input_dim = 24, hidden_dim = 128, z_dim = 25, output_dim = 12, fc=False, dropout=0.2, feat_drop=0., 
                     attn_drop=0., heads=1,att_ew=False, ew_dims=1, backbone='map_encoder', freeze=6,
                     bn=False, gn=False):
         super().__init__()
@@ -80,25 +79,18 @@ class VAE_GNN_prior(nn.Module):
         # Map Encoder #
         ###############
         if backbone == 'map_encoder':
-            self.feature_extractor = My_MapEncoder(input_channels = 1, input_size=112, 
-                                                    hidden_channels = [16,32,32,40], output_size = 64, 
+            self.feature_extractor = My_MapEncoder(input_channels = 3, input_size=128, 
+                                                    hidden_channels = [16,32,32,64], output_size = hidden_dim, 
                                                     kernels = [5,5,3,3], strides = [1,2,2,2])
             enc_dims = hidden_dim*2+output_dim    
-            dec_dims = z_dim + hidden_dim#*2
+            dec_dims = z_dim + hidden_dim*2
         
+        elif backbone == 'resnet18':       
+            self.feature_extractor = ResNet18(hidden_dim, freeze)
+            enc_dims = 2*hidden_dim + output_dim 
+            dec_dims = z_dim + hidden_dim*2
         elif backbone == 'resnet':       
-            model_ft = resnet18(pretrained=True)
-            modules = list(model_ft.children())[:-3]
-            modules.append(torch.nn.AdaptiveAvgPool2d((1, 1))) 
-            modules.append(torch.nn.Flatten(start_dim=1))
-            modules.append(torch.nn.Linear(256, hidden_dim)) 
-            self.feature_extractor = torch.nn.Sequential(*modules) 
-            ct=0
-            for child in self.feature_extractor.children():
-                ct+=1
-                if ct < freeze:  #freeze 2 BasicBlocks , train last one 128 -> 256
-                    for param in child.parameters():
-                        param.requires_grad = False
+            self.feature_extractor = ResNet50(hidden_dim, freeze)
             enc_dims = 2*hidden_dim + output_dim 
             dec_dims = z_dim + hidden_dim*2
         
@@ -112,7 +104,6 @@ class VAE_GNN_prior(nn.Module):
             enc_dims = hidden_dim + output_dim + 256
             dec_dims = z_dim + hidden_dim + 256
 
-            
 
         ############################
         # Input Features Embedding #
@@ -216,12 +207,15 @@ class VAE_GNN_prior(nn.Module):
         #### PRIOR ####
         # Embeddings concatenation
         h_prior = torch.cat([maps_emb.flatten(start_dim=1), h_emb], dim=-1)
+
         #h = self.linear_cat(h)
         if self.bn:
             h = self.bn_enc(h_prior)
         elif self.gn:
             h = self.gn_enc(h_prior)
+
         h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
+
         mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
 
         #### Sample from the latent distribution ###
@@ -230,13 +224,18 @@ class VAE_GNN_prior(nn.Module):
         #### DECODE ####      
         #z_dec = self.embedding_z(z_sample)      
         h_dec = torch.cat([maps_emb.flatten(start_dim=1), h_emb, z_sample],dim=-1)
+
         if self.bn:
             h_dec = self.bn_dec(h_dec)
         elif self.gn:
             h_dec = self.gn_dec(h_dec) 
+
         h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
+
         h_dec = torch.cat([h_dec, z_sample],dim=-1)
+
         recon_y = self.MLP_decoder(h_dec)
+
         return recon_y, mu_prior, log_var_prior
  
     def forward(self, g, feats, e_w, snorm_n, snorm_e, gt, maps):
@@ -292,23 +291,23 @@ class VAE_GNN_prior(nn.Module):
 if __name__ == '__main__':
     history_frames = 4
     future_frames = 12
-    hidden_dims = 768
+    hidden_dims = 128
     heads = 1
 
     input_dim = 8*history_frames
-    output_dim = 3*future_frames 
+    output_dim = 2*future_frames 
 
     hidden_dims = round(hidden_dims / heads) 
     model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=1, backbone='resnet')
-    #summary(model.feature_extractor, (1,112,112), device='cpu')
+    #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=False, history_frames=history_frames, future_frames=future_frames) 
-    test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_batch)
+    test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
     for batch in test_dataloader:
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps = batch
         e_w = batched_graph.edata['w']
         e_w= e_w.unsqueeze(1)
-        y, mu, log_var,_,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:],  maps)
+        y, mu, log_var,_,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
         print(y.shape)
 
     

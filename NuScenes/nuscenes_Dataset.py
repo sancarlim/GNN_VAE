@@ -28,7 +28,6 @@ total_frames = history_frames + future_frames #2s of history + 6s of prediction
 max_num_objects = 150 
 total_feature_dimension = 16
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
-map_path = os.path.join(base_path, 'hd_maps_challenge')
 
 def collate_batch(samples):
     graphs, masks, feats, gt, maps = map(list, zip(*samples))  # samples is a list of tuples
@@ -63,6 +62,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
+        self.map_path = os.path.join(base_path, 'hd_maps_challenge_224')
         self.future_frames = future_frames
         self.types = rel_types
         if train_val_test == 'train':
@@ -85,14 +85,26 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
     def load_data(self):
         with open(self.raw_dir, 'rb') as reader:
             [self.all_feature, self.all_adjacency, self.all_mean_xy, self.all_tokens]= pickle.load(reader)
-        '''
-        if self.train_val_test == 'train':  
+        if self.train_val_test == 'train': 
             with open(os.path.join(base_path,'nuscenes_challenge_val.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
             self.all_feature = np.vstack((self.all_feature[:,:80], all_feature))
             self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency))
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
+        '''
+        with open(os.path.join(base_path,'nuscenes_challenge_test.pkl'), 'rb') as reader:
+            [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
+        if self.train_val_test == 'train': 
+            self.all_feature = np.vstack((self.all_feature[:,:80], all_feature[:,:80]))[3080:]
+            self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency[:,:80,:80]))[3080:]
+            self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))[3080:]
+            self.all_tokens = np.hstack((self.all_tokens,all_tokens ))[3080:]
+        else:
+            self.all_feature = np.vstack((self.all_feature[:,:80], all_feature[:,:80]))[:3080]
+            self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency[:,:80,:80]))[:3080]
+            self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))[:3080]
+            self.all_tokens = np.hstack((self.all_tokens,all_tokens ))[:3080]
         '''
         self.all_feature=torch.from_numpy(self.all_feature).type(torch.float32)
         
@@ -118,7 +130,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         self.object_type = self.all_feature[:,:,now_history_frame,8].int()
         self.scene_ids = self.all_feature[:,0,now_history_frame,-3].numpy()
         self.all_scenes = np.unique(self.scene_ids)
-        self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 !
+        self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
         self.output_mask= self.all_feature[:,:,self.history_frames:,-2].unsqueeze_(-1)
         
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  
@@ -127,10 +139,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         #self.all_feature[:,:,:self.history_frames,:2] = self.all_feature[:,:,:self.history_frames,:2]/rescale_xy
 
         ###### Normalize with training statistics to have 0 mean and std=1 #######
-        self.node_features = self.all_feature[:,:,:self.history_frames,feature_id] 
-        #self.node_features[:,:,:,:2] = (self.node_features[:,:,:,:2] - 0.1579) / 12.4354
-        self.node_labels = self.all_feature[:,:,self.history_frames:,:3] #- 0.1579) / 12.4354
-        self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.2 ) / 1.79     # Normalize heading (mean 0.2 std 1.79) for z0 loss.
+        self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+        #self.node_features = ( self.node_features - 0.0013 ) / 5.398
+        self.node_labels = self.all_feature[:,:,self.history_frames:,:2] 
+        #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
 
         self.xy_dist=[spatial.distance.cdist(self.all_feature[i][:,now_history_frame,:2], self.node_features[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
         
@@ -160,9 +172,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         gt = self.node_labels[idx, :self.num_visible_object[idx]]
         output_mask = self.output_mask[idx, :self.num_visible_object[idx]]
 
-        
         sample_token=str(self.all_tokens[idx][0,1])
-        with open(os.path.join(map_path, sample_token + '.pkl'), 'rb') as reader:
+        with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
         
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
@@ -176,10 +187,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     
-    val_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
-    test_dataloader=iter(DataLoader(train_dataset, batch_size=512, shuffle=False, collate_fn=collate_batch) )
+    test_dataloader=iter(DataLoader(train_dataset, batch_size=4, shuffle=False, collate_fn=collate_batch) )
     for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps in test_dataloader:
         print(feats.shape, batched_graph.num_nodes(), maps.shape)
     
