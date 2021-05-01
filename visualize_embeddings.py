@@ -3,6 +3,8 @@ import numpy as np
 import os
 import cv2
 import sys
+import dgl
+os.environ['DGLBACKEND'] = 'pytorch'
 sys.path.append('./NuScenes')
 from tensorboardX import SummaryWriter
 from NuScenes.main_GNN_VAE_nuscenes import LitGNN
@@ -11,7 +13,17 @@ from models.VAE_GNN import VAE_GNN
 from models.VAE_PRIOR import VAE_GNN_prior
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset
 from torch.utils.data import DataLoader
+from utils import compute_change_pos
 
+FREQUENCY = 2
+dt = 1 / FREQUENCY
+history = 2
+future = 6
+history_frames = history*FREQUENCY
+future_frames = future*FREQUENCY
+total_frames = history_frames + future_frames #2s of history + 6s of prediction
+input_dim_model = (history_frames-1)*8 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
+output_dim = future_frames*2
 
 IMGS_FOLDER = './NuScenes/Outputs_VisEmb/Images'
 EMBS_FOLDER = './NuScenes/Outputs_VisEmb/Embeddings'
@@ -219,34 +231,45 @@ if __name__ == '__main__':
     parser.add_argument("--feat_drop", type=float, default=0.)
     parser.add_argument("--attn_drop", type=float, default=0.25)
     parser.add_argument("--heads", type=int, default=2, help='Attention heads (GAT)')
+    parser.add_argument("--scene_id", type=int, default=557, help="Scene id to visualize.")
+    parser.add_argument("--sample", type=str, default='6cc682bbd4544c4ea5281c9d87b9c4f6', help="sample to visualize.")
     
     args = parser.parse_args()
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout, 
-                            ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze)
+                            ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze).to('cuda')
     elif args.model_type == 'vae_prior':
         model = VAE_GNN_prior(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
-                        attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
-                        bn=(args.norm=='bn'), gn=(args.norm=='gn'))
+                        attn_drop=args.attn_drop, heads=args.heads, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
+                        bn=(args.norm=='bn'), gn=(args.norm=='gn')).to('cuda')
     else:
         model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
-                        attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
-                        bn=(args.norm=='bn'), gn=(args.norm=='gn'))
+                        attn_drop=args.attn_drop, heads=args.heads, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
+                        bn=(args.norm=='bn'), gn=(args.norm=='gn')).to('cuda')
     
 
 
-    test_dataset = nuscenes_Dataset(train_val_test = 'test', rel_types = LitGNN_sys.rel_types, history_frames=LitGNN_sys.history_frames, future_frames=LitGNN_sys.future_frames, challenge_eval=True)  
-    test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
+    test_dataset = nuscenes_Dataset(train_val_test = 'test', rel_types = args.ew_dims > 1, history_frames=history_frames, future_frames = future_frames, challenge_eval = True)  
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch)
 
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=model, history_frames=history_frames, future_frames= future_frames,
-                    test_dataset=test_dataset, rel_types=args.ew_dims>1, model_type=args.model_type)
+                    test_dataset=test_dataset, rel_types=args.ew_dims > 1, model_type=args.model_type)
 
     DF = DeepFeatures(model = LitGNN_sys.model, imgs_folder = IMGS_FOLDER, embs_folder = EMBS_FOLDER, tensorboard_folder = TB_FOLDER)
     
-    for batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps in test_batch:
-        if scene_id != self.scene_id:
-            return 
+    for g, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps in test_dataloader:
+        
+        sample_token = tokens_eval[0][1]
 
-    DF.write_embeddings(g.to('cuda'), feats.to('cuda'), e_w.to('cuda'), snorm_n,snorm_e, maps.to('cuda'))
-    DF.create_tensorboard_log()
+        if scene_id != args.scene_id or (args.sample is not None and sample_token != args.sample):
+            continue
+
+        if args.ew_dims == 1:
+            e_w= g.edata['w'].unsqueeze(1)
+     
+        feats_vel, labels = compute_change_pos(feats,labels_pos, scale_factor = 1)
+        feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
+
+        DF.write_embeddings(g.to('cuda'), feats.to('cuda'), e_w.to('cuda'), snorm_n, snorm_e, maps.to('cuda'))
+        DF.create_tensorboard_log()
