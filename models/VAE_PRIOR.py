@@ -65,8 +65,8 @@ class MLP_Dec(nn.Module):
 
 
 class VAE_GNN_prior(nn.Module):
-    def __init__(self, input_dim = 24, hidden_dim = 128, z_dim = 25, output_dim = 12, fc=False, dropout=0.2, feat_drop=0., 
-                    attn_drop=0., heads=1,att_ew=False, ew_dims=1, backbone='map_encoder', freeze=6,
+    def __init__(self, input_dim = 24, hidden_dim = 128, z_dim = 25, output_dim = 12, fc = False, dropout = 0.2, feat_drop = 0., 
+                    attn_drop = 0., heads = 1, att_ew = True, ew_dims = 1, backbone = 'map_encoder', freeze = 6,
                     bn=False, gn=False):
         super().__init__()
         self.heads = heads
@@ -270,11 +270,11 @@ class VAE_GNN_prior(nn.Module):
             h = self.bn_enc(h_prior)
         elif self.gn:
             h = self.gn_enc(h_prior)
-        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
+        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    x
         mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
 
         #### Sample from the latent distribution ###
-        z_sample = self.reparameterize(mu, log_var)
+        z_sample = self.reparameterize(mu_prior, log_var_prior)
         
         #### DECODE ####      
         #h_dec = self.embedding_z(z_sample)       
@@ -286,7 +286,7 @@ class VAE_GNN_prior(nn.Module):
         h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
         h_dec = torch.cat([h_dec, z_sample],dim=-1)
         recon_y = self.MLP_decoder(h_dec)
-        return recon_y, mu, log_var, mu_prior, log_var_prior, z_sample[:,0]
+        return recon_y, z_sample, mu, log_var, mu_prior, log_var_prior
 
 if __name__ == '__main__':
     history_frames = 4

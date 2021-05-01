@@ -10,23 +10,24 @@ class ResNet18(nn.Module):
         super(ResNet18, self).__init__()
         
         model_ft = resnet18(pretrained=True)
-        modules = list(model_ft.children())[:-3]
-        modules.append(nn.ModuleList([
+        self.base = nn.Sequential(*list(model_ft.children())[:-3])
+        self.last_conv = torch.nn.Sequential(
             torch.nn.AdaptiveAvgPool2d((1, 1)),
-            torch.nn.Flatten(start_dim=1),
+            torch.nn.Flatten(),
             torch.nn.Linear(256, hidden_dim),
-        ]))
+        )
         #model_ft.fc = nn.Linear(model_ft.fc.in_features, hidden_dim)
-        self.model = torch.nn.Sequential(*modules) 
         ct=0
-        for child in self.model.children():
+        for child in self.base.children():
             ct+=1
             if ct < freeze:  #if 7 freeze 2 BasicBlocks , train last one 128 -> 256
                 for param in child.parameters():
                     param.requires_grad = False
 
     def forward(self, x):
-        return self.model(x)
+        x = self.base(x)
+        x = self.last_conv(x)
+        return x
 
 
 class ResNet50(nn.Module):
@@ -43,7 +44,7 @@ class ResNet50(nn.Module):
                             #nn.BatchNorm2d(256),
                             #nn.ReLU(inplace=True),
                             nn.AdaptiveAvgPool2d((1, 1)),
-                            nn.Flatten(start_dim=1),
+                            nn.Flatten(),
                             nn.Linear(512, hidden_dim),
         ) 
         #model_ft.fc = nn.Linear(model_ft.fc.in_features, hidden_dim)
