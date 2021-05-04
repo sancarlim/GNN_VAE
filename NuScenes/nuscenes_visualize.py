@@ -127,9 +127,11 @@ class LitGNN(pl.LightningModule):
          
     def test_step(self, test_batch, batch_idx):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps = test_batch
+        
+        sample_token = tokens_eval[0][1]
+        '''
         if scene_id != self.scene_id:
             return 
-        sample_token = tokens_eval[0][1]
         if self.sample is not None and  sample_token != self.sample:
             return
         print(tokens_eval)
@@ -170,7 +172,7 @@ class LitGNN(pl.LightningModule):
             prediction_all_agents.append(np.stack([pred_x, pred_y],axis=-1))
 
         prediction_all_agents = np.array(prediction_all_agents)        
-        
+        '''
         #VISUALIZE SEQUENCE
         #Get Scene from sample token ie current frame
         scene=nuscenes.get('scene', nuscenes.get('sample',sample_token)['scene_token'])
@@ -220,27 +222,26 @@ class LitGNN(pl.LightningModule):
             idx = np.where(np.array(tokens_eval)== token[0])[0][0]  #idx ordered checked
             instance, sample_token = token
             annotation = helper.get_sample_annotation(instance, sample_token)
-            category = annotation['category_name'].split('.')[0]
-            attribute = nuscenes.get('attribute', annotation['attribute_tokens'][0])['name']
-
+            category = annotation['category_name'].split('.')
+            #attribute = nuscenes.get('attribute', annotation['attribute_tokens'][0])['name']
             history = feats[idx,:,:2].cpu().numpy()
+            '''
             prediction = prediction_all_agents[:,idx]
             if self.scale_factor == 1:
                 pass#history = history*12.4354+0.1579
             else:
                 history = history*rescale_xy   
+            '''
             #remove zero rows (no data in those frames) and rescale to obtain global coords.
-            history = (history[history.all(axis=1)]*rescale_xy.cpu().numpy() + mean_xy[0]).squeeze() 
+            history = (history[history.all(axis=1)] + mean_xy[0]).squeeze() 
             future = labels_pos[idx].cpu().numpy()
             future = future[future.all(axis=1)] + mean_xy[0]
             if len(history.shape) < 2:
                 history=np.vstack([history, history])
             if future.shape[0] == 1:
                 future=np.vstack([future, future])
-
+            '''
             # Plot predictions
-            
-
             if category != 'vehicle':
                 if 'sitting_lying_down' not in attribute:
                     if self.model_type == 'scout':
@@ -257,19 +258,18 @@ class LitGNN(pl.LightningModule):
                             except:
                                 print('2-th leading minor of the array is not positive definite.',  sys.exc_info()[0], 'ocurred.' )
                                 continue
-                        
-                    '''
+
                     #Plot 25 predictions (modes)
                     for sample_num in range(prediction.shape[0]):
                         ax.plot(predictions[sample_num, :, 0], predictions[sample_num, :, 1], 'ko-',
                                 zorder=620,
                                 markersize=2,
                                 linewidth=1, alpha=0.7)
-                    '''
-
+                    
+            
             else:  
                 if 'parked' not in attribute:
-                    '''
+                    
                     if self.model_type == 'scout':
                         ax.plot(prediction[0, :, 0], prediction[0, :, 1], 'mo-',
                                 zorder=620,
@@ -284,7 +284,7 @@ class LitGNN(pl.LightningModule):
                             except:
                                 print('2-th leading minor of the array is not positive definite')
                                 continue
-                    '''
+                    
                     
                     #Plot 25 predictions (modes)
                     for sample_num in range(prediction.shape[0]):
@@ -293,16 +293,8 @@ class LitGNN(pl.LightningModule):
                                 color=line_colors[i % len(line_colors)],
                                 markersize=5,
                                 linewidth=3, alpha=0.7)
-                    
-
-                
-                r_img = rotate(cars[i % len(cars)], quaternion_yaw(Quaternion(annotation['rotation']))*180/math.pi,reshape=True)
-                oi = OffsetImage(r_img, zoom=0.01, zorder=700)
-                veh_box = AnnotationBbox(oi, (history[-1, 0], history[-1, 1]), frameon=False)
-                veh_box.zorder = 700
-                ax.add_artist(veh_box)
-                i += 1
-
+            '''        
+            
             #Plot history
             ax.plot(history[:, 0], history[:, 1], 'k--')
 
@@ -318,25 +310,44 @@ class LitGNN(pl.LightningModule):
             # Current Node Position
             node_circle_size=0.3
             circle_edge_width=0.5
-            circle = plt.Circle((history[-1, 0],
+            if category[1] == 'motorcycle' or category[1] == 'bicycle':
+                circle = plt.Circle((history[-1, 0],
                                 history[-1, 1]),
                                 node_circle_size,
-                                facecolor='g',
+                                facecolor='y',
                                 edgecolor='k',
                                 lw=circle_edge_width,
                                 zorder=3)
-            ax.add_artist(circle)
+                ax.add_artist(circle)
+            elif category[0] == 'vehicle': 
+                r_img = rotate(cars[i % len(cars)], quaternion_yaw(Quaternion(annotation['rotation']))*180/math.pi,reshape=True)
+                oi = OffsetImage(r_img, zoom=0.01, zorder=700)
+                veh_box = AnnotationBbox(oi, (history[-1, 0], history[-1, 1]), frameon=False)
+                veh_box.zorder = 700
+                ax.add_artist(veh_box)
+                i += 1
+            else:
+                circle = plt.Circle((history[-1, 0],
+                                history[-1, 1]),
+                                node_circle_size,
+                                facecolor='c',
+                                edgecolor='k',
+                                lw=circle_edge_width,
+                                zorder=3)
+                ax.add_artist(circle)
+            
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + self.model_type + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
-        print('Image saved in: ', os.path.join(base_path, 'visualizations' , scene_name + '_' + sample_token + '.jpg'))
+        fig.savefig(os.path.join(base_path, 'samples_vis2' , scene_name + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        print('Image saved in: ', os.path.join(base_path, 'samples_vis2' , scene_name + '_' + sample_token + '.jpg'))
+        plt.clf()
    
 def main(args: Namespace):
     print(args)
 
     seed=seed_everything(0)
 
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
+    test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
@@ -359,8 +370,8 @@ def main(args: Namespace):
       
     trainer = pl.Trainer(gpus=1, deterministic=True,  profiler=True) 
  
-    LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
-                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
+    #LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
+    #                train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
 
     
     trainer.test(LitGNN_sys)
