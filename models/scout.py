@@ -284,10 +284,10 @@ class SCOUT(nn.Module):
             self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, 0., 0.,att_ew, res_weight=res_weight, res_connection=res_connection, e_dims=hidden_dim//2*2 )  #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu)
             self.linear1 = nn.Linear(hidden_dim, output_dim)          
         else:
-            self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim, e_dims=self.hidden_dim,res_weight=res_weight, merge='cat', res_connection=res_connection , num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) #GATConv(hidden_dim, hidden_dim, heads,feat_drop, attn_drop,residual=True, activation='relu')
+            self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2,res_weight=res_weight, merge='cat', res_connection=res_connection , num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) #GATConv(hidden_dim, hidden_dim, heads,feat_drop, attn_drop,residual=True, activation='relu')
             #self.embedding_e2 = nn.Linear(2, hidden_dims*heads) if ew_type else nn.Linear(1, hidden_dims*heads)
             self.resize_e2 = nn.ReplicationPad1d(hidden_dim * heads//2-1)
-            self.gat_2 = MultiHeadGATLayer(hidden_dim*heads, hidden_dim*heads,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, res_connection=res_connection ,num_heads=1, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
+            self.gat_2 = MultiHeadGATLayer(hidden_dim*heads, hidden_dim*heads,e_dims=hidden_dim*heads//2*2, res_weight=res_weight, res_connection=res_connection ,num_heads=1, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
             self.linear1 = nn.Linear(hidden_dim*heads, output_dim)
 
         if dropout:
@@ -357,40 +357,40 @@ class SCOUT(nn.Module):
             else:
                 e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
             g.edata['w']=e
+
         h = self.gat_2(g, h, snorm_n)  #BN Y RELU DENTRO DE LA GAT_LAYER
         h = self.dropout_l(h)
         y = self.linear1(h)
-        return y
-        '''
+        
         # Normalize the probabilities to sum to 1 for inference.
         mode_probabilities = y[:, -self.num_modes:].clone()
+        predictions = y[:, :-self.num_modes]
+
         if not self.training:
             mode_probabilities = F.softmax(mode_probabilities, dim=-1)
 
-        predictions = y[:, :-self.num_modes]
-
         return torch.cat((predictions, mode_probabilities), 1)
-        '''
+        
+
 if __name__ == '__main__':
 
     history_frames = 4
     future_frames = 12
-    hidden_dims = 1024
+    hidden_dims = 768
     heads = 2
 
-    input_dim = 8*history_frames
+    input_dim = 9*history_frames
     output_dim = 2*future_frames 
 
     hidden_dims = round(hidden_dims / heads) 
-    model = SCOUT(input_dim=input_dim, hidden_dim=hidden_dims, output_dim=output_dim, heads=heads, 
-                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, ew_dims=False,backbone='None', freeze=True)
+    model = SCOUT(input_dim=input_dim, hidden_dim=hidden_dims, output_dim=output_dim, heads=heads,  ew_dims= True,
+                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='None', freeze=True)
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=False, history_frames=history_frames, future_frames=future_frames) 
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_batch)
 
     for batch in test_dataloader:
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps = batch
         e_w = batched_graph.edata['w']
-        e_w= e_w.unsqueeze(1)
         out = model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
         print(out.shape)

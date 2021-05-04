@@ -154,7 +154,8 @@ class MTPLoss:
 
         return best_mode
 
-    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, last_loc: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Computes the MTP loss on a batch.
         The predictions are of shape [batch_size, n_ouput_neurons of last linear layer]
@@ -167,7 +168,12 @@ class MTPLoss:
 
         batch_losses = torch.Tensor().requires_grad_(True).to(predictions.device)
         trajectories, modes = self._get_trajectory_and_modes(predictions)
-
+        
+        for mode in range(self.num_modes):
+            for i in range(1,trajectories.shape[-2]):
+                trajectories[:,mode,i,:] = torch.sum(trajectories[:,mode,i-1:i+1,:],dim=-2) 
+        trajectories += last_loc
+        
         trajectories = trajectories * mask
         targets = targets * mask
 
