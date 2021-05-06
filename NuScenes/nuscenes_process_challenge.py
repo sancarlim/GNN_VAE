@@ -25,7 +25,7 @@ from nuscenes.prediction.input_representation.combinators import Rasterizer
 #508 0 sequences???
 scene_blacklist = [499, 515, 517]
 
-max_num_objects = 110  #pkl np.arrays with same dimensions
+max_num_objects = 50  #pkl np.arrays with same dimensions
 total_feature_dimension = 16 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects
 
 FREQUENCY = 2
@@ -42,7 +42,7 @@ nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
 # Helper for querying past and future data for an agent.
 helper = PredictHelper(nuscenes)
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
-base_path_map = os.path.join(base_path, 'hd_maps_challenge_train2')
+base_path_map = os.path.join(base_path, 'hd_maps_challenge_224')
 
 static_layer_rasterizer = StaticLayerRasterizer(helper)
 agent_rasterizer = AgentBoxesWithFadedHistory(helper, seconds_of_history=2)
@@ -56,7 +56,7 @@ transform = transforms.Compose(
                         )
 
 
-neighbor_distance = 35
+neighbor_distance = 40
 
 def pol2cart(th, r):
     """
@@ -336,19 +336,16 @@ def process_scene(scene, samples, instances):
             current_ind = i #start_ind + history_frames -1   #0,8,16,24
             start_ind = current_ind - (history_frames-1)
             end_ind = current_ind + future_frames if (current_ind + future_frames) <= len(tracks)-1 else len(tracks)-1
-            object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind, sample_token)  
-            '''
+            #object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind, sample_token)  
+            
             #HD MAPs
             maps = np.array( [input_representation.make_input_representation(instance, sample_token) for instance in tracks[current_ind]["node_id"]] )   #[N_agents,500,500,3] uint8 range [0,256] 
             maps = np.array( F.interpolate(torch.tensor(maps.transpose(0,3,1,2)), size=224) ).transpose(0,2,3,1)
 
-            if maps.shape[0] != object_frame_feature[0,3,-1]:
-                print(f'maps {maps.shape[0]} agents and features {object_frame_feature[0,3,-1]}')
-                
             save_path_map = os.path.join(base_path_map, sample_token + '.pkl')
             with open(save_path_map, 'wb') as writer:
                 pickle.dump(maps,writer)  
-            '''
+    '''
             all_feature_list.append(object_frame_feature)
             all_adjacency_list.append(neighbor_matrix)	
             all_mean_list.append(mean_xy)
@@ -361,7 +358,7 @@ def process_scene(scene, samples, instances):
     tokens = np.array(tokens_list, dtype=object)
     return all_feature, all_adjacency, all_mean, tokens
     
-
+'''
 
 # Data splits for the CHALLENGE - returns instance and sample token  
 
@@ -376,7 +373,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 #scenes_df=[]
 #nuscenes.field2token('scene', 'name','scene-0')[0]
 
-for data_class in ['val']:
+for data_class in ['test']:
     scenes_token_set=set()
     samples=set()
     instances=set()
@@ -392,9 +389,10 @@ for data_class in ['val']:
     all_tokens = []
     
     for scene_token in scenes_token_set:
-        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', scene_token), samples, instances)   # 780 scene_token = '656bb27689dc4e9b8e4559e3f6a7e534'
-        print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed! {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
-    
+        #all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', scene_token), samples, instances)   # 780 scene_token = '656bb27689dc4e9b8e4559e3f6a7e534'
+        process_scene(nuscenes.get('scene', scene_token), samples, instances)
+        print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed!")# {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
+    '''
         all_data.extend(all_feature_sc)
         all_adjacency.extend(all_adjacency_sc)
         all_mean_xy.extend(all_mean_sc)
@@ -409,5 +407,5 @@ for data_class in ['val']:
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')
-    
+    '''
 

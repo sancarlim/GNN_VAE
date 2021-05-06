@@ -338,8 +338,8 @@ class LitGNN(pl.LightningModule):
             
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'samples_vis2' , scene_name + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
-        print('Image saved in: ', os.path.join(base_path, 'samples_vis2' , scene_name + '_' + sample_token + '.jpg'))
+        fig.savefig(os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + self.global_step + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        print('Image saved in: ', os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + self.global_step + '_' + sample_token + '.jpg'))
         plt.clf()
    
 def main(args: Namespace):
@@ -347,7 +347,7 @@ def main(args: Namespace):
 
     seed=seed_everything(0)
 
-    test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)

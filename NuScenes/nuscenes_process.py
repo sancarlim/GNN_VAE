@@ -25,7 +25,7 @@ from nuscenes.prediction.input_representation.combinators import Rasterizer
 #508 0 sequences???
 scene_blacklist = [992]
 
-max_num_objects = 40  #pkl np.arrays with same dimensions
+max_num_objects = 50  #pkl np.arrays with same dimensions
 total_feature_dimension = 16 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects
 
 FREQUENCY = 2
@@ -256,10 +256,10 @@ def process_scene(scene):
             else:
                 attribute = [None]
             
-            if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
-                node_type = 1
-            elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
-                node_type = 2
+            #if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
+            #    node_type = 1
+            #elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
+            #    node_type = 2
             if 'vehicle' in category and 'parked' not in attribute:                 
                 node_type = 0
             else:
@@ -289,10 +289,12 @@ def process_scene(scene):
                                     'height': annotation['size'][2]}).fillna(0)    #inplace=True         
 
             data = data.append(data_point, ignore_index=True)
+        '''
         #Avoid empty frames in the middle of the sequence
         if not data.empty and data_point.frame_id != frame_id:
             print(f'scene {scene_id}, last frame {frame_id}')
             break
+        '''
         frame_id += 1
         '''
         #Zero-centralization per frame (sequence)
@@ -410,7 +412,7 @@ for data_class in ['val']:
     all_adjacency = np.array(all_adjacency) 
     all_mean_xy = np.array(all_mean_xy) 
     all_tokens = np.array(all_tokens)
-    save_path = '/media/14TBDISK/sandra/nuscenes_processed/nuscenes_' + data_class + '2.pkl'
+    save_path = '/media/14TBDISK/sandra/nuscenes_processed/nuscenes_challenge_' + data_class + '.pkl'
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')
