@@ -187,7 +187,7 @@ class MTPLoss:
                                                 trajectories=trajectories[batch_idx])
 
             best_mode_trajectory = trajectories[batch_idx, best_mode, :].unsqueeze(0)
-
+            
             regression_loss = f.smooth_l1_loss(best_mode_trajectory, targets[batch_idx])
 
             mode_probabilities = modes[batch_idx].unsqueeze(0)
@@ -236,26 +236,24 @@ def check_overlap(preds):
         return torch.count_nonzero(intersect)/len(intersect) #percentage of intersections between all combinations
         #y_intersect=[np.argwhere(np.diff(np.sign(preds[i,:,1].cpu()-preds[j,:,1].cpu()))).size > 0 for j in range(i+1,len(preds)) for i in range(len(preds)-1)]
 
-    
 def compute_change_pos(feats,gt, scale_factor):
     gt_vel = gt.clone()  #.detach().clone()
     feats_vel = feats[:,:,:2].clone()
     new_mask_feats = (feats_vel[:, 1:]!=0) * (feats_vel[:, :-1]!=0) 
     new_mask_gt = (gt_vel[:, 1:]!=0) * (gt_vel[:, :-1]!=0) 
-    
+
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
-    #if scale_factor==1:
-    #    gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:]*5.398+0.0013)) * new_mask_gt[:,0:1]
-    #else:
-    rescale_xy=torch.ones((1,1,2), device=feats.device)*scale_factor
-    gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]*rescale_xy) * new_mask_gt[:,0:1]
+    if scale_factor==1:
+        gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:]*12.4354+0.1579)) * new_mask_gt[:,0:1]
+    else:
+        rescale_xy=torch.ones((1,1,2), device=feats.device)*scale_factor
+        gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]*rescale_xy) * new_mask_gt[:,0:1]
 
     feats_vel[:, 1:] = (feats_vel[:, 1:] - feats_vel[:, :-1]) * new_mask_feats
     feats_vel[:, 0] = 0
-    
-    return feats_vel, gt_vel
 
+    return feats_vel, gt_vel
 
 def plot_grad_flow(named_parameters):
     '''Plots the gradients flowing through different layers in the net during training.

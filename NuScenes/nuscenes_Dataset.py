@@ -29,8 +29,28 @@ max_num_objects = 150
 total_feature_dimension = 16
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
 
+def collate_batch_test(samples):
+    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
+    masks = torch.vstack(masks)
+    feats = torch.vstack(feats)
+    gt = torch.vstack(gt).float()
+    if maps[0] is not None:
+        maps = torch.vstack(maps)
+
+    if maps.shape[0] != feats.shape[0]:
+        print(scene_ids[0])
+    sizes_n = [graph.number_of_nodes() for graph in graphs] # graph sizes
+    snorm_n = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_n]
+    snorm_n = torch.cat(snorm_n).sqrt()  # graph size normalization 
+    sizes_e = [graph.number_of_edges() for graph in graphs] # nb of edges
+    snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
+    snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
+    batched_graph = dgl.batch(graphs)  # batch graphs
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps
+
+
 def collate_batch(samples):
-    graphs, masks, feats, gt, maps = map(list, zip(*samples))  # samples is a list of tuples
+    graphs, masks, feats, gt, maps, scene_id = map(list, zip(*samples))  # samples is a list of tuples
     if maps[0] is not None:
         maps = torch.vstack(maps)
     masks = torch.vstack(masks)
@@ -43,7 +63,7 @@ def collate_batch(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_id[0]
 
 
 #feats.mean 0.1579 std 12.4354
@@ -62,13 +82,16 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
-        self.map_path = os.path.join(base_path, 'hd_maps_challenge_224')
+        self.map_path = os.path.join(base_path, 'hd_maps_challenge_224') 
         self.future_frames = future_frames
         self.types = rel_types
+        
         if train_val_test == 'train':
             self.raw_dir =os.path.join(base_path, 'nuscenes_challenge_train.pkl' )#train_val_test = 'train_filter'
         else:
             self.raw_dir = os.path.join(base_path,'nuscenes_challenge_test.pkl')
+        
+        #self.raw_dir = os.path.join(base_path,'nuscenes_' + train_val_test + '.pkl')
         self.challenge_eval = challenge_eval
         self.transform = transforms.Compose(
                             [
@@ -85,27 +108,23 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
     def load_data(self):
         with open(self.raw_dir, 'rb') as reader:
             [self.all_feature, self.all_adjacency, self.all_mean_xy, self.all_tokens]= pickle.load(reader)
+        
         if self.train_val_test == 'train': 
             with open(os.path.join(base_path,'nuscenes_challenge_val.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
-            self.all_feature = np.vstack((self.all_feature[:,:80], all_feature))
-            self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency))
+            self.all_feature = np.vstack((self.all_feature[:,:50], all_feature))
+            self.all_adjacency = np.vstack((self.all_adjacency[:,:50,:50],all_adjacency))
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
-        '''
-        with open(os.path.join(base_path,'nuscenes_challenge_test.pkl'), 'rb') as reader:
-            [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
-        if self.train_val_test == 'train': 
-            self.all_feature = np.vstack((self.all_feature[:,:80], all_feature[:,:80]))[3080:]
-            self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency[:,:80,:80]))[3080:]
-            self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))[3080:]
-            self.all_tokens = np.hstack((self.all_tokens,all_tokens ))[3080:]
-        else:
-            self.all_feature = np.vstack((self.all_feature[:,:80], all_feature[:,:80]))[:3080]
-            self.all_adjacency = np.vstack((self.all_adjacency[:,:80,:80],all_adjacency[:,:80,:80]))[:3080]
-            self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))[:3080]
-            self.all_tokens = np.hstack((self.all_tokens,all_tokens ))[:3080]
-        '''
+        
+            with open(os.path.join(base_path,'nuscenes_challenge_test.pkl'), 'rb') as reader:
+                [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
+        
+            self.all_feature = np.vstack((self.all_feature[:,:50], all_feature[:,:50]))
+            self.all_adjacency = np.vstack((self.all_adjacency[:,:50,:50],all_adjacency[:,:50,:50]))
+            self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
+            self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
+        
         self.all_feature=torch.from_numpy(self.all_feature).type(torch.float32)
         
     def process(self):
@@ -140,7 +159,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
         ###### Normalize with training statistics to have 0 mean and std=1 #######
         self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
-        #self.node_features = ( self.node_features - 0.0013 ) / 5.398
+        self.node_features[:,:,:,:2] = (self.node_features[:,:,:,:2] - 0.1579) / 12.4354 # 0.0013) / 4.5471
         self.node_labels = self.all_feature[:,:,self.history_frames:,:2] 
         #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
 
@@ -171,26 +190,26 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         feats = self.node_features[idx, :self.num_visible_object[idx]]
         gt = self.node_labels[idx, :self.num_visible_object[idx]]
         output_mask = self.output_mask[idx, :self.num_visible_object[idx]]
-
+        
         sample_token=str(self.all_tokens[idx][0,1])
         with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
-        
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
+        
         #img=((maps[0]-maps[0].min())*255/(maps[0].max()-maps[0].min())).numpy().transpose(1,2,0)
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         
         if self.challenge_eval:
             return graph, output_mask, feats, gt, self.all_tokens[idx], int(self.scene_ids[idx]), self.all_mean_xy[idx,:2], maps            
             
-        return graph, output_mask, feats, gt, maps
+        return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx])
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
-    test_dataloader=iter(DataLoader(train_dataset, batch_size=4, shuffle=False, collate_fn=collate_batch) )
-    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps in test_dataloader:
-        print(feats.shape, batched_graph.num_nodes(), maps.shape)
+    test_dataloader=iter(DataLoader(train_dataset, batch_size=4, shuffle=False, collate_fn=collate_batch_test) )
+    for batch in test_dataloader:
+        pass#print(feats.shape, batched_graph.num_nodes())
     
