@@ -208,7 +208,7 @@ class LitGNN(pl.LightningModule):
             #total_loss = self.mtp_loss(pred, labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
 
         # Log metrics
-        self.log("Sweep/train_loss",  total_loss)
+        self.log("Sweep/train_loss",  total_loss, on_step=False, on_epoch=True)
         return total_loss
 
     def validation_step(self, val_batch, batch_idx):
