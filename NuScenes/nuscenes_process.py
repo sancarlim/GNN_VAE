@@ -34,7 +34,7 @@ history = 2
 future = 6
 history_frames = history*FREQUENCY
 future_frames = future*FREQUENCY
-total_frames = history_frames + future_frames #2s of history + 6s of prediction
+total_frames = history_frames + future_frames + 1#2s of history + 6s of prediction
 
 # This is the path where you stored your copy of the nuScenes dataset.
 DATAROOT = '/media/14TBDISK/nuscenes'
@@ -190,11 +190,11 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
     '''
 
     ############ SECOND OPTION ###############
+    object_feature_list = []
     now_all_object_id = set([val for frame in range(start_frame, end_frame) for val in tracks[frame]["node_id"]])  #todos los obj en los15 hist frames
     non_visible_object_id_list = list(now_all_object_id - set(visible_node_id_list))  #obj en alguno de los 15 frames pero no el ultimo
     total_num = len(now_all_object_id)
 
-    object_feature_list = []
     for frame_ind in range(start_frame, end_frame):	
         now_frame_feature_dict = {node_id : (
             list(tracks[frame_ind]['position'][np.where(np.array(tracks[frame_ind]['node_id'])==node_id)[0][0]] - mean_xy)+ 
@@ -206,6 +206,7 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
         now_frame_feature = np.array([now_frame_feature_dict.get(vis_id, np.zeros(total_feature_dimension)) for vis_id in visible_node_id_list])
         object_feature_list.append(now_frame_feature)
 
+    
     object_feature_list = np.array(object_feature_list)  # T,V,C
     assert object_feature_list.shape[1] < max_num_objects
     assert object_feature_list.shape[0] == total_frames
@@ -256,12 +257,12 @@ def process_scene(scene):
             else:
                 attribute = [None]
             
-            #if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
-            #    node_type = 1
-            #elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
-            #    node_type = 2
+            if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
+                node_type = 2
+            elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
+                node_type = 3
             if 'vehicle' in category and 'parked' not in attribute:                 
-                node_type = 0
+                node_type = 1
             else:
                 continue
 
@@ -289,12 +290,12 @@ def process_scene(scene):
                                     'height': annotation['size'][2]}).fillna(0)    #inplace=True         
 
             data = data.append(data_point, ignore_index=True)
-        '''
+        
         #Avoid empty frames in the middle of the sequence
         if not data.empty and data_point.frame_id != frame_id:
             print(f'scene {scene_id}, last frame {frame_id}')
             break
-        '''
+        
         frame_id += 1
         '''
         #Zero-centralization per frame (sequence)
@@ -338,10 +339,10 @@ def process_scene(scene):
     tokens_list = []
     maps_list = []
     visible_object_indexes_list=[]
-    step=1 #iterate over 2s
+    step=2 #iterate over 1s
     for i, frame in enumerate(frame_id_list[:-total_frames+1:step]):
         start_ind = i
-        current_ind = start_ind + history_frames -1   #0,8,16,24
+        current_ind = start_ind + history_frames   #0,8,16,24
         end_ind = start_ind + total_frames
         object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind)  
         '''
@@ -380,7 +381,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 
 
 #scenes_df=[]
-for data_class in ['val']:
+for data_class in ['train']:
     scenes_token_set=set()
     for ann in ns_scene_names[data_class]:
         _, sample_token=ann.split("_")
@@ -399,7 +400,7 @@ for data_class in ['val']:
         #if scene_id in scene_blacklist:  # Some scenes have bad localization
         #    continue
         
-        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene',scene_token))
+        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene',nuscenes.field2token('scene', 'name','scene-0365')[0]))
         print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed!")# {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
 
         all_data.extend(all_feature_sc)
@@ -412,7 +413,7 @@ for data_class in ['val']:
     all_adjacency = np.array(all_adjacency) 
     all_mean_xy = np.array(all_mean_xy) 
     all_tokens = np.array(all_tokens)
-    save_path = '/media/14TBDISK/sandra/nuscenes_processed/nuscenes_challenge_' + data_class + '.pkl'
+    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_step2_' + data_class + '.pkl'
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')
