@@ -37,9 +37,8 @@ FREQUENCY = 2
 dt = 1 / FREQUENCY
 history = 2
 future = 6
-history_frames = history*FREQUENCY
+history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
-total_frames = history_frames + future_frames #2s of history + 6s of prediction
 input_dim_model = (history_frames-1)*8 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2
 base_path='/media/14TBDISK/sandra/nuscenes_processed'
@@ -62,6 +61,7 @@ layers = ['drivable_area',
 
 line_colors = ['#375397', '#F05F78', '#80CBE5', '#ABCB51', '#C8B0B0']
 
+ego_car = plt.imread('/home/sandra/PROGRAMAS/DBU_Graph/NuScenes/icons/Car TOP_VIEW ROBOT.png')
 cars = [plt.imread('/home/sandra/PROGRAMAS/DBU_Graph/NuScenes/icons/Car TOP_VIEW 375397.png'),
         plt.imread('/home/sandra/PROGRAMAS/DBU_Graph/NuScenes/icons/Car TOP_VIEW F05F78.png'),
         plt.imread('/home/sandra/PROGRAMAS/DBU_Graph/NuScenes/icons/Car TOP_VIEW 80CBE5.png'),
@@ -70,8 +70,8 @@ cars = [plt.imread('/home/sandra/PROGRAMAS/DBU_Graph/NuScenes/icons/Car TOP_VIEW
 
 scene_blacklist = [499, 515, 517]
 
-patch_margin = 10
-min_diff_patch = 30
+patch_margin = 50
+min_diff_patch = 50
 
 
 def collate_batch(samples):
@@ -107,6 +107,8 @@ class LitGNN(pl.LightningModule):
         self.scene_id = scene_id
         self.model_type = model_type
         self.sample = sample
+        self.cnt = 0
+        self.scene = 0
     
     def forward(self, graph, feats,e_w,snorm_n,snorm_e):
         # in lightning, forward defines the prediction/inference actions
@@ -127,7 +129,9 @@ class LitGNN(pl.LightningModule):
          
     def test_step(self, test_batch, batch_idx):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps = test_batch
-        
+        if scene_id != self.scene:
+            self.scene = scene_id
+            self.cnt = 0 
         sample_token = tokens_eval[0][1]
         '''
         if scene_id != self.scene_id:
@@ -186,24 +190,25 @@ class LitGNN(pl.LightningModule):
         nusc_map = NuScenesMap(dataroot=DATAROOT, map_name=location)
 
         #Render map with ego poses
-        sample_tokens = nuscenes.field2token('sample', 'scene_token', scene['token'])
-        ego_poses=[]
-        for sample_token in sample_tokens:
-            sample_record = nuscenes.get('sample', sample_token)
+        #sample_tokens = nuscenes.field2token('sample', 'scene_token', scene['token'])
+        #ego_poses=[]
+        #for sample_token in sample_tokens:
+        
+        sample_record = nuscenes.get('sample', sample_token)
             
-            # Poses are associated with the sample_data. Here we use the lidar sample_data.
-            sample_data_record = nuscenes.get('sample_data', sample_record['data']['LIDAR_TOP'])
-            pose_record = nuscenes.get('ego_pose', sample_data_record['ego_pose_token'])
+        # Poses are associated with the sample_data. Here we use the lidar sample_data.
+        sample_data_record = nuscenes.get('sample_data', sample_record['data']['LIDAR_TOP'])
+        pose_record = nuscenes.get('ego_pose', sample_data_record['ego_pose_token'])
 
-            # Calculate the pose on the map and append.
-            ego_poses.append(pose_record['translation'])
+        # Calculate the pose on the map and append.
+        ego_poses=np.array(pose_record['translation'][:2])
         # Check that ego poses aren't empty.
-        assert len(ego_poses) > 0, 'Error: Found 0 ego poses. Please check the inputs.'
-        ego_poses = np.vstack(ego_poses)[:, :2]
+        #assert len(ego_poses) > 0, 'Error: Found 0 ego poses. Please check the inputs.'
+        #ego_poses = np.vstack(ego_poses)[:, :2]
         
         # Render the map patch with the current ego poses.
-        min_patch = np.floor(ego_poses.min(axis=0) - patch_margin)
-        max_patch = np.ceil(ego_poses.max(axis=0) + patch_margin)
+        min_patch = np.floor(ego_poses - patch_margin)
+        max_patch = np.ceil(ego_poses + patch_margin)
         diff_patch = max_patch - min_patch
         if any(diff_patch < min_diff_patch):
             center_patch = (min_patch + max_patch) / 2
@@ -216,6 +221,11 @@ class LitGNN(pl.LightningModule):
                                     render_egoposes_range=False,
                                     render_legend=True, bitmap=None)
 
+        r_img = rotate(ego_car, quaternion_yaw(Quaternion(pose_record['rotation']))*180/math.pi,reshape=True)
+        oi = OffsetImage(r_img, zoom=0.02, zorder=500)
+        veh_box = AnnotationBbox(oi, (ego_poses[0], ego_poses[1]), frameon=False)
+        veh_box.zorder = 500
+        ax.add_artist(veh_box)
         #Print agents trajectories
         i = 0
         for token in tokens_eval:
@@ -233,10 +243,15 @@ class LitGNN(pl.LightningModule):
                 history = history*rescale_xy   
             '''
             #remove zero rows (no data in those frames) and rescale to obtain global coords.
-            history = (history[history.all(axis=1)] + mean_xy[0]).squeeze() 
+            history = (history[history.all(axis=1)] + mean_xy[0])
             future = labels_pos[idx].cpu().numpy()
             future = future[future.all(axis=1)] + mean_xy[0]
-            if len(history.shape) < 2:
+            if history.shape[0] < 2:
+                if history.shape[0] == 0:
+                    history = np.array(annotation['translation'][:2])
+                    if history.all() != mean_xy[0].all():
+                        print(f'WATCH OUT!')
+
                 history=np.vstack([history, history])
             if future.shape[0] == 1:
                 future=np.vstack([future, future])
@@ -296,7 +311,9 @@ class LitGNN(pl.LightningModule):
             '''        
             
             #Plot history
-            ax.plot(history[:, 0], history[:, 1], 'k--')
+            ax.plot(history[:, 0], 
+                    history[:, 1], 
+                    'k--')
 
             #Plot ground truth
             if future.shape[0] > 0:
@@ -315,15 +332,15 @@ class LitGNN(pl.LightningModule):
                                 history[-1, 1]),
                                 node_circle_size,
                                 facecolor='y',
-                                edgecolor='k',
+                                edgecolor='y',
                                 lw=circle_edge_width,
                                 zorder=3)
                 ax.add_artist(circle)
             elif category[0] == 'vehicle': 
                 r_img = rotate(cars[i % len(cars)], quaternion_yaw(Quaternion(annotation['rotation']))*180/math.pi,reshape=True)
-                oi = OffsetImage(r_img, zoom=0.01, zorder=700)
+                oi = OffsetImage(r_img, zoom=0.01, zorder=500)
                 veh_box = AnnotationBbox(oi, (history[-1, 0], history[-1, 1]), frameon=False)
-                veh_box.zorder = 700
+                veh_box.zorder = 500
                 ax.add_artist(veh_box)
                 i += 1
             else:
@@ -331,16 +348,18 @@ class LitGNN(pl.LightningModule):
                                 history[-1, 1]),
                                 node_circle_size,
                                 facecolor='c',
-                                edgecolor='k',
+                                edgecolor='c',
                                 lw=circle_edge_width,
                                 zorder=3)
                 ax.add_artist(circle)
+
             
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + self.global_step + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
-        print('Image saved in: ', os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + self.global_step + '_' + sample_token + '.jpg'))
+        fig.savefig(os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + str(self.cnt) + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        print('Image saved in: ', os.path.join(base_path, 'samples_ns_train' , scene_name + '_' + str(self.cnt) + '_' + sample_token + '.jpg'))
         plt.clf()
+        self.cnt += 1
    
 def main(args: Namespace):
     print(args)
