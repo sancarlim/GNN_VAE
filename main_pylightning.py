@@ -74,7 +74,7 @@ class LitGNN(pl.LightningModule):
         return pred
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(self.parameters(), lr=self.lr1, weight_decay=self.wd)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr1, weight_decay=self.wd)
         #opt = torch.optim.AdamW([
         #        {'params': self.model.base.parameters()},
         #        {'params': self.model.embedding_h.parameters(), 'lr': self.lr1},
@@ -169,7 +169,7 @@ class LitGNN(pl.LightningModule):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene_id = train_batch
         #last_loc = feats[:,-1:,:2].detach().clone() 
         feats_vel, labels_vel = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
-        feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
+        #feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         e_w = batched_graph.edata['w'].float()
         if self.model_type != 'gcn' and not self.rel_types:
             e_w= e_w.unsqueeze(1)
@@ -188,7 +188,7 @@ class LitGNN(pl.LightningModule):
             mask = output_masks.expand(output_masks.shape[0],self.future_frames, 2)  #expand mask (B,Tpred,1) -> (B,T_pred,2)
             total_loss = self.mdn_loss(pred, labels,mask.contiguous().view(mask.shape[0],-1).unsqueeze(1).expand_as(pred[1]))  
         else:
-            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            pred=pred.view(labels.shape[0],self.future_frames,-1)
             #Socially consistent
             #perc_overlap = check_overlap(pred*output_masks) if self.alfa !=0 else 0
             overall_sum_time, overall_num = self.huber_loss(pred, labels_vel, output_masks, self.delta)  #(B,6)
@@ -198,7 +198,7 @@ class LitGNN(pl.LightningModule):
             #total_loss = self.mtp_loss(pred, labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
 
         # Log metrics
-        self.log("Sweep/train_loss",  total_loss, on_step=True, on_epoch=False)
+        self.log("Sweep/train_loss",  total_loss, on_step=False, on_epoch=True)
         return total_loss
     
     def validation_step(self, val_batch, batch_idx):
@@ -418,7 +418,7 @@ def main(args: Namespace):
 
 
     input_dim_model = input_dim*(history_frames - 1)  #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
-    output_dim = 2*future_frames#3 * (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
+    output_dim = 3 * (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
 
     if args.model_type == 'gat_mdn':
         hidden_dims = args.hidden_dims // args.heads

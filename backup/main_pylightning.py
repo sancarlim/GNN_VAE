@@ -76,11 +76,10 @@ class LitGNN(pl.LightningModule):
         return pred
 
     def configure_optimizers(self):
-        #opt = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        #opt = torch.optim.AdamW(self.parameters(), lr=self.lr2, weight_decay=self.wd)
         opt = torch.optim.AdamW([
                 {'params': self.model.base.parameters()},
-                {'params': self.model.embedding_h.parameters(), 'lr': self.lr1},
-                {'params': self.model.feature_extractor.parameters(), 'lr': self.lr1} ], lr=self.lr2, weight_decay=self.wd)
+                {'params': self.model.embeddings.parameters(), 'lr': self.lr1}], lr=self.lr2, weight_decay=self.wd)
 
         
         return {
@@ -170,7 +169,7 @@ class LitGNN(pl.LightningModule):
     def training_step(self, train_batch, batch_idx):
         '''needs to return a loss from a single batch'''
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scenes = train_batch
-        #last_loc = feats[:,-1:,:2].detach().clone() *12.4354+0.1579
+        last_loc = feats[:,-1:,:2].detach().clone() * 5
         '''
         if self.dataset == 'apollo':
             #USE CHANGE IN POS AS INPUT
@@ -179,7 +178,9 @@ class LitGNN(pl.LightningModule):
             feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:,:] # torch.cat([feats[:,:,:self.input_dim], feats_vel], dim=-1)
         else:
         '''
-        _, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
+        #_, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
+        label = labels_pos[:,-1] - last_loc
+
         #feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         e_w = batched_graph.edata['w'].float()
         if self.model_type != 'gcn' and not self.rel_types:
@@ -199,10 +200,10 @@ class LitGNN(pl.LightningModule):
             mask = output_masks.expand(output_masks.shape[0],self.future_frames, 2)  #expand mask (B,Tpred,1) -> (B,T_pred,2)
             total_loss = self.mdn_loss(pred, labels,mask.contiguous().view(mask.shape[0],-1).unsqueeze(1).expand_as(pred[1]))  
         else:
-            pred=pred.view(labels.shape[0],self.future_frames,-1)
+            pred=pred.view(feats.shape[0],1,-1)  #(labels.shape[0],self.future_frames,-1)
             #Socially consistent
             perc_overlap = check_overlap(pred*output_masks) if self.alfa !=0 else 0
-            overall_sum_time, overall_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            overall_sum_time, overall_num = self.huber_loss(pred, label, output_masks[:,-1:], self.delta)  #(B,6)
             #overall_sum_time , overall_num, _ = self.compute_RMSE_batch(pred[:,:self.future_frames,:], labels[:,:self.future_frames,:], output_masks[:,self.history_frames:self.total_frames,:])
             total_loss = torch.sum(overall_sum_time)/torch.sum(overall_num.sum(dim=-2))*(1+self.alfa*perc_overlap) + self.beta*(overall_sum_time[-1]/overall_num.sum(dim=-2)[-1])
             #total_loss = self.mtp_loss(pred, labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
@@ -218,7 +219,7 @@ class LitGNN(pl.LightningModule):
         last_loc = feats[:,-1:,:2].detach().clone() 
         #Rescale last_loc to compare with labels_pos
         if self.scale_factor == 1:
-            last_loc = last_loc*12.4354+0.15797
+            last_loc = last_loc * 5 
         else:
             rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
             last_loc = last_loc*rescale_xy
@@ -230,7 +231,8 @@ class LitGNN(pl.LightningModule):
             feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:,:] #torch.cat([feats[:,:,:self.input_dim], feats_vel], dim=-1)
         else:
         '''
-        _, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
+        #_, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
+        label = labels_pos[:,-1] - last_loc
         #feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
 
         e_w = batched_graph.edata['w']
@@ -257,20 +259,21 @@ class LitGNN(pl.LightningModule):
             mask = output_masks.expand(output_masks.shape[0],self.future_frames, 2)  #expand mask (B,Tpred,1) -> (B,T_pred,2)
             total_loss = self.mdn_loss(pred, labels,mask.contiguous().view(mask.shape[0],-1).unsqueeze(1).expand_as(pred[1]))  
         else:
-            pred=pred.view(labels.shape[0],self.future_frames,-1)
+            pred=pred.view(feats.shape[0],1,-1)
 
             #for debugging purposees - comparing directly with training_loss
-            overall_sum_time, overall_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            overall_sum_time, overall_num = self.huber_loss(pred, label[:,-1:], output_masks[:,-1:], self.delta)  #(B,6)
             huber_loss = torch.sum(overall_sum_time)/torch.sum(overall_num.sum(dim=-2))
 
             #if self.dataset == 'apollo':
-
+            '''
             for i in range(1,labels.shape[-2]):
                 pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
-            pred += last_loc
-
-            _ , overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos, output_masks)
-            rmse_loss = torch.sum(torch.sum((x2y2_error**0.5), dim=0) / torch.sum(overall_num, dim=0)) / self.future_frames #T->1
+            '''
+            pred = pred + last_loc
+            
+            _ , overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos[:,-1:], output_masks[:,-1:])
+            rmse_loss = torch.sum(torch.sum((x2y2_error**0.5), dim=0) / torch.sum(overall_num, dim=0)) #/ self.future_frames #T->1
 
 
         self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
@@ -286,15 +289,9 @@ class LitGNN(pl.LightningModule):
 
     def test_step(self, test_batch, batch_idx):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scenes = test_batch
-        rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
-        last_loc = feats[:,-1:,:2].detach().clone() *12.4354+0.1579
-        feats_vel, _ = compute_change_pos(feats,labels_pos[:,:,:2], last_loc)
-        feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
-        #Rescale last_loc to compare with labels_pos
-        if self.scale_factor == 1:
-            pass#last_loc = last_loc*12.4354+0.1579
-        else:
-            last_loc = last_loc*rescale_xy
+        last_loc = feats[:,-1:,:2].detach().clone() * 5
+        #feats_vel, _ = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
+        #feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:] 
         '''
         if self.dataset == 'apollo':
             #USE CHANGE IN POS AS INPUT
@@ -315,7 +312,7 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats,e_w, rel_type,norm)
         else:
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            pred=pred.view(feats.shape[0],-1)
             '''
             mode_prob = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
@@ -359,12 +356,12 @@ class LitGNN(pl.LightningModule):
             self.log_dict({'test/ade': min(ade), "test/fde": fde[ade.index(min(ade))]}) #, sync_dist=True
 
         else:
-            for i in range(1,labels_pos.shape[-2]):
-                pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
+            #for i in range(1,labels_pos.shape[-2]):
+            #    pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
             pred += last_loc
 
-            _, overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos, output_masks)
-            long_err, lat_err, _ = compute_long_lat_error(pred, labels_pos, output_masks)
+            _, overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos[:,-1:], output_masks)
+            long_err, lat_err, _ = compute_long_lat_error(pred, labels_pos[:,-1:], output_masks)
             overall_loss_time = torch.sum((x2y2_error**0.5),dim=0) / torch.sum(overall_num, dim=0) #T
             overall_loss_time[torch.isnan(overall_loss_time)]=0
             overall_long_err = torch.sum(long_err.detach(),dim=0) / torch.sum(overall_num, dim=0) #T
@@ -374,11 +371,13 @@ class LitGNN(pl.LightningModule):
             self.overall_loss_time_list.append(overall_loss_time.detach().cpu().numpy())
             self.overall_long_err_list.append(overall_long_err.detach().cpu().numpy())
             self.overall_lat_err_list.append(overall_lat_err.detach().cpu().numpy())
-
+            '''
             if self.future_frames == 8:
                 self.log_dict({'Sweep/test_loss': torch.sum(overall_loss_time), "test/loss_1": overall_loss_time[1:2], "test/loss_2": overall_loss_time[4:5], "test/loss_2.5": overall_loss_time[6:7], "test/loss_3.2": overall_loss_time[-1:] })
             else:
                 self.log_dict({'Sweep/test_loss': torch.sum(overall_loss_time)/self.future_frames, "test/loss_1": overall_loss_time[1:2], "test/loss_2": overall_loss_time[3:4], "test/loss_3": overall_loss_time[5:6], "test/loss_4": overall_loss_time[7:8], "test/loss_5": overall_loss_time[9:10], "test/loss_6": overall_loss_time[11:] }) #, sync_dist=True
+            '''
+            self.log('Sweep/loss_6', torch.sum(overall_loss_time))
 
     def on_test_epoch_end(self):
         #wandb_logger.experiment.save(run.name + '.ckpt')
@@ -425,7 +424,7 @@ def main(args: Namespace):
         print(len(train_dataset), len(val_dataset), len(test_dataset))
         input_dim = 6
     else:
-        history_frames = 4
+        history_frames = 5
         future_frames = 12
         train_dataset = nuscenes_Dataset( train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames) #3447
         val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames)  #919
@@ -434,14 +433,14 @@ def main(args: Namespace):
 
 
     input_dim_model = input_dim*(history_frames)  #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
-    output_dim = 2*future_frames #if config.probabilistic == False else 5*future_frames
+    output_dim = 2 #3 * (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
 
     if args.model_type == 'gat_mdn':
-        hidden_dims = args.hidden_dims // args.heads
-        model = SCOUT_MDN(input_dim=input_dim_model, hidden_dim=hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=False, feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_type=args.ew_dims>1)
+        #hidden_dims = args.hidden_dims // args.heads
+        model = SCOUT_MDN(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=False, feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_type=args.ew_dims>1)
     elif args.model_type == 'gat':
-        hidden_dims = args.hidden_dims // args.heads
-        model = SCOUT(input_dim=input_dim_model, hidden_dim=hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
+        #hidden_dims = args.hidden_dims // args.heads
+        model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone, freeze=args.freeze)
     elif args.model_type == 'gcn':
         model = model = GCN(in_feats=input_dim_model, hid_feats=args.hidden_dims, out_feats=output_dim, dropout=config.dropout, gcn_drop=config.gcn_drop, bn=config.bn, gcn_bn=config.gcn_bn, embedding=config.embedding)
@@ -509,7 +508,7 @@ if __name__ == '__main__':
                                         choices=['nuscenes', 'ind', 'apollo'])
     parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN or GroupNorm.")
     parser.add_argument("--backbone", type=str, default='resnet18', help="Choose CNN backbone.",
-                                        choices=['resnet_gray', 'resnet18', 'map_encoder'])
+                                        choices=['resnet_gray', 'None', 'resnet18', 'resnet50', 'mobilenet', 'map_encoder'])
     parser.add_argument('--freeze', type=int, default=6, help="Layers to freeze in resnet18.")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--feat_drop", type=float, default=0.)
