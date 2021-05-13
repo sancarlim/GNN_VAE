@@ -32,9 +32,9 @@ FREQUENCY = 2
 dt = 1 / FREQUENCY
 history = 2
 future = 6
-history_frames = history*FREQUENCY
+history_frames = history*FREQUENCY 
 future_frames = future*FREQUENCY
-total_frames = history_frames + future_frames + 1#2s of history + 6s of prediction
+total_frames = history_frames + future_frames + 1 #2s of history + 6s of prediction
 
 # This is the path where you stored your copy of the nuScenes dataset.
 DATAROOT = '/media/14TBDISK/nuscenes'
@@ -42,7 +42,7 @@ nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
 # Helper for querying past and future data for an agent.
 helper = PredictHelper(nuscenes)
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
-base_path_map = os.path.join(base_path, 'hd_maps_224')
+base_path_map = os.path.join(base_path, 'hd_maps_ego')
 
 static_layer_rasterizer = StaticLayerRasterizer(helper)
 agent_rasterizer = AgentBoxesWithFadedHistory(helper, seconds_of_history=2)
@@ -136,6 +136,95 @@ def calculate_rotated_bboxes(center_points_x, center_points_y, length, width, ro
 
     return rotated_bbox_vertices
 
+
+def augment_scene(scene, angle):
+    def rotate_pc(pc, alpha):
+        M = np.array([[np.cos(alpha), -np.sin(alpha)],
+                      [np.sin(alpha), np.cos(alpha)]])
+        return M @ pc
+
+    data_columns_vehicle = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration', 'heading'], ['x', 'y']])
+    data_columns_vehicle = data_columns_vehicle.append(pd.MultiIndex.from_tuples([('heading', '°'), ('heading', 'd°')]))
+    data_columns_vehicle = data_columns_vehicle.append(pd.MultiIndex.from_product([['velocity', 'acceleration'], ['norm']]))
+
+    data_columns_pedestrian = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration'], ['x', 'y']])
+
+    scene_aug = Scene(timesteps=scene.timesteps, dt=scene.dt, name=scene.name, non_aug_scene=scene)
+
+    alpha = angle * np.pi / 180
+
+    for node in scene.nodes:
+        if node.type == 'PEDESTRIAN':
+            x = node.data.position.x.copy()
+            y = node.data.position.y.copy()
+
+            x, y = rotate_pc(np.array([x, y]), alpha)
+
+            vx = derivative_of(x, scene.dt)
+            vy = derivative_of(y, scene.dt)
+            ax = derivative_of(vx, scene.dt)
+            ay = derivative_of(vy, scene.dt)
+
+            data_dict = {('position', 'x'): x,
+                         ('position', 'y'): y,
+                         ('velocity', 'x'): vx,
+                         ('velocity', 'y'): vy,
+                         ('acceleration', 'x'): ax,
+                         ('acceleration', 'y'): ay}
+
+            node_data = pd.DataFrame(data_dict, columns=data_columns_pedestrian)
+
+            node = Node(node_type=node.type, node_id=node.id, data=node_data, first_timestep=node.first_timestep)
+        elif node.type == 'VEHICLE':
+            x = node.data.position.x.copy()
+            y = node.data.position.y.copy()
+
+            heading = getattr(node.data.heading, '°').copy()
+            heading += alpha
+            heading = (heading + np.pi) % (2.0 * np.pi) - np.pi
+
+            x, y = rotate_pc(np.array([x, y]), alpha)
+
+            vx = derivative_of(x, scene.dt)
+            vy = derivative_of(y, scene.dt)
+            ax = derivative_of(vx, scene.dt)
+            ay = derivative_of(vy, scene.dt)
+
+            v = np.stack((vx, vy), axis=-1)
+            v_norm = np.linalg.norm(np.stack((vx, vy), axis=-1), axis=-1, keepdims=True)
+            heading_v = np.divide(v, v_norm, out=np.zeros_like(v), where=(v_norm > 1.))
+            heading_x = heading_v[:, 0]
+            heading_y = heading_v[:, 1]
+
+            data_dict = {('position', 'x'): x,
+                         ('position', 'y'): y,
+                         ('velocity', 'x'): vx,
+                         ('velocity', 'y'): vy,
+                         ('velocity', 'norm'): np.linalg.norm(np.stack((vx, vy), axis=-1), axis=-1),
+                         ('acceleration', 'x'): ax,
+                         ('acceleration', 'y'): ay,
+                         ('acceleration', 'norm'): np.linalg.norm(np.stack((ax, ay), axis=-1), axis=-1),
+                         ('heading', 'x'): heading_x,
+                         ('heading', 'y'): heading_y,
+                         ('heading', '°'): heading,
+                         ('heading', 'd°'): derivative_of(heading, dt, radian=True)}
+
+            node_data = pd.DataFrame(data_dict, columns=data_columns_vehicle)
+
+            node = Node(node_type=node.type, node_id=node.id, data=node_data, first_timestep=node.first_timestep,
+                        non_aug_node=node)
+
+        scene_aug.nodes.append(node)
+    return scene_aug
+
+
+def augment(scene):
+    scene_aug = np.random.choice(scene.augmented)
+    scene_aug.temporal_scene_graph = scene.temporal_scene_graph
+    scene_aug.map = scene.map
+    return scene_aug
+
+
 def process_tracks(tracks, start_frame, end_frame, current_frame):
     '''
         Tracks: a list of (n_frames ~40f = 20s) tracks_per_frame ordered by frame.
@@ -144,8 +233,8 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
         Returns data processed for a sequence of 8s (2s of history, 6s of labels)
     '''
     sample_token = tracks[current_frame]['sample_token'][0]
-    visible_node_id_list = tracks[current_frame]["node_id"]  #All agents in the current frame      
-    num_visible_object = len(visible_node_id_list)
+    visible_node_id_list = tracks[current_frame]["node_id"][:-1]  #All agents in the current frame but ego
+    num_visible_object = len(visible_node_id_list) + 1
 
     #Zero-centralization per frame (sequence)
     mean_xy = [tracks[current_frame]['x_global'].mean(),tracks[current_frame]['y_global'].mean(),0]
@@ -191,19 +280,24 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
 
     ############ SECOND OPTION ###############
     object_feature_list = []
+    while start_frame < 0:
+        object_feature_list.append(np.zeros(shape=(num_visible_object,total_feature_dimension)))
+        start_frame += 1
+    
     now_all_object_id = set([val for frame in range(start_frame, end_frame) for val in tracks[frame]["node_id"]])  #todos los obj en los15 hist frames
-    non_visible_object_id_list = list(now_all_object_id - set(visible_node_id_list))  #obj en alguno de los 15 frames pero no el ultimo
-    total_num = len(now_all_object_id)
 
-    for frame_ind in range(start_frame, end_frame):	
+    for frame_ind in range(start_frame, end_frame + 1):	
         now_frame_feature_dict = {node_id : (
             list(tracks[frame_ind]['position'][np.where(np.array(tracks[frame_ind]['node_id'])==node_id)[0][0]] - mean_xy)+ 
             list(tracks[frame_ind]['motion'][np.where(np.array(tracks[frame_ind]['node_id'])==node_id)[0][0]]) + 
             list(tracks[frame_ind]['info_agent'][np.where(np.array(tracks[frame_ind]['node_id'])==node_id)[0][0]]) +
-            list(tracks[frame_ind]['info_sequence'][0]) + [1] + [num_visible_object]
+            list(tracks[frame_ind]['info_sequence'][0]) + 
+            [1] + [num_visible_object]  #mask is 0 for ego
             ) for node_id in tracks[frame_ind]["node_id"] if node_id in visible_node_id_list}
         # if the current object is not at this frame, we return all 0s 
         now_frame_feature = np.array([now_frame_feature_dict.get(vis_id, np.zeros(total_feature_dimension)) for vis_id in visible_node_id_list])
+        ego_feature = np.array((list(tracks[frame_ind]['position'][-1] - mean_xy) + list(tracks[frame_ind]['motion'][-1]) + list(tracks[frame_ind]['info_agent'][-1]) + list(tracks[frame_ind]['info_sequence'][-1]) + [0] + [num_visible_object])).reshape(1, total_feature_dimension)
+        now_frame_feature = np.vstack((now_frame_feature, ego_feature))
         object_feature_list.append(now_frame_feature)
 
     
@@ -261,7 +355,7 @@ def process_scene(scene):
                 node_type = 2
             elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
                 node_type = 3
-            if 'vehicle' in category and 'parked' not in attribute:                 
+            if 'vehicle' in category and 'parked' not in attribute and 'stopped' not in attribute:                 
                 node_type = 1
             else:
                 continue
@@ -270,7 +364,8 @@ def process_scene(scene):
             heading_change_rate = helper.get_heading_change_rate_for_agent(instance_token, sample_token)
             velocity =  helper.get_velocity_for_agent(instance_token, sample_token)
             acceleration = helper.get_acceleration_for_agent(instance_token, sample_token)
-            
+            if np.isnan(velocity[0]):
+                continue
 
             data_point = pd.Series({'scene_id': scene_id,
                                     'sample_token': sample_token,
@@ -290,11 +385,29 @@ def process_scene(scene):
                                     'height': annotation['size'][2]}).fillna(0)    #inplace=True         
 
             data = data.append(data_point, ignore_index=True)
-        
-        #Avoid empty frames in the middle of the sequence
-        if not data.empty and data_point.frame_id != frame_id:
-            print(f'scene {scene_id}, last frame {frame_id}')
-            break
+
+        if not data.empty:
+            # Ego Vehicle
+            sample_data = nuscenes.get('sample_data', sample['data']['CAM_FRONT'])
+            annotation = nuscenes.get('ego_pose', sample_data['ego_pose_token'])
+            data_point = pd.Series({'scene_id': scene_id,
+                                    'sample_token': sample_token,
+                                    'frame_id': frame_id,
+                                    'type': 0,
+                                    'node_id': sample_data['ego_pose_token'],
+                                    'x_global': annotation['translation'][0],
+                                    'y_global': annotation['translation'][1],
+                                    'heading': Quaternion(annotation['rotation']).yaw_pitch_roll[0],
+                                    'vel_x': 0,
+                                    'vel_y': 0,
+                                    'acc_x': 0,
+                                    'acc_y': 0,
+                                    'heading_change_rate': 0,
+                                    'length': 4,
+                                    'width': 1.7,
+                                    'height': 1.5})
+                                   
+            data = data.append(data_point, ignore_index=True)
         
         frame_id += 1
         '''
@@ -339,21 +452,32 @@ def process_scene(scene):
     tokens_list = []
     maps_list = []
     visible_object_indexes_list=[]
-    step=2 #iterate over 1s
-    for i, frame in enumerate(frame_id_list[:-total_frames+1:step]):
-        start_ind = i
-        current_ind = start_ind + history_frames   #0,8,16,24
-        end_ind = start_ind + total_frames
+    step=1 #iterate over <step> frames
+    for i in range(1,len(frame_id_list[:-future_frames])):  #, frame in enumerate(frame_id_list[1:-total_frames+1:step]):
+        # Avoid sequences where only ego_vehicle is present
+        if len(tracks[i]['frame_id']) < 2:
+            continue
+        current_ind = i #start_ind + history_frames -1   #0,8,16,24
+        start_ind = current_ind - history_frames
+        end_ind = current_ind + future_frames
         object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind)  
-        '''
+        
         #HD MAPs
+        '''
+        # Retrieve ego_vehicle pose
         sample_token = tracks[current_ind]['sample_token'][0]
+        sample_record = nuscenes.get('sample', sample_token)     
+        sample_data_record = nuscenes.get('sample_data', sample_record['data']['LIDAR_TOP'])
+        poserecord = nuscenes.get('ego_pose', sample_data_record['ego_pose_token'])
+        poserecord['instance_token'] = sample_data_record['ego_pose_token']
+
         #maps = [transform(input_representation.make_input_representation(instance, sample_token)) for instance in tracks[current_frame]["node_id"]]   #Tensor [N_agents,3,112,112] float32 [0,1]       
-        maps = np.array( [input_representation.make_input_representation(instance, sample_token) for instance in tracks[current_ind]["node_id"]] )   #[N_agents,500,500,3] uint8 range [0,256] 
+        maps = np.array( [input_representation.make_input_representation(instance, sample_token, poserecord, ego=False) for instance in tracks[current_ind]["node_id"][:-1]] )   #[N_agents,500,500,3] uint8 range [0,256] 
+        maps = np.vstack((maps, np.expand_dims( input_representation.make_input_representation(tracks[current_ind]["node_id"][-1], sample_token, poserecord, ego=True), axis=0) ))
         maps = np.array( F.interpolate(torch.tensor(maps.transpose(0,3,1,2)), size=224) ).transpose(0,2,3,1)
         #img=((maps[0]-maps[0].min())*255/(maps[0].max()-maps[0].min())).numpy().transpose(1,2,0)
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-
+        
         save_path_map = os.path.join(base_path_map, sample_token + '.pkl')
         with open(save_path_map, 'wb') as writer:
             pickle.dump(maps,writer)  
@@ -381,7 +505,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 
 
 #scenes_df=[]
-for data_class in ['train']:
+for data_class in ['train','val','test']:
     scenes_token_set=set()
     for ann in ns_scene_names[data_class]:
         _, sample_token=ann.split("_")
@@ -400,7 +524,8 @@ for data_class in ['train']:
         #if scene_id in scene_blacklist:  # Some scenes have bad localization
         #    continue
         
-        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene',nuscenes.field2token('scene', 'name','scene-0365')[0]))
+        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', scene_token))
+        
         print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed!")# {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
 
         all_data.extend(all_feature_sc)
@@ -413,7 +538,7 @@ for data_class in ['train']:
     all_adjacency = np.array(all_adjacency) 
     all_mean_xy = np.array(all_mean_xy) 
     all_tokens = np.array(all_tokens)
-    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_step2_' + data_class + '.pkl'
+    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_3s_' + data_class + '.pkl'
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')
