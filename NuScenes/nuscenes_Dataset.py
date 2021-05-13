@@ -82,14 +82,14 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
-        self.map_path = os.path.join(base_path, 'hd_maps_challenge_224_ego') 
+        self.map_path = os.path.join(base_path, 'hd_maps_ego') 
         self.future_frames = future_frames
         self.types = rel_types
         
         if train_val_test == 'train':
-            self.raw_dir =os.path.join(base_path, 'ns_challenge_train.pkl' )#train_val_test = 'train_filter'
+            self.raw_dir =os.path.join(base_path, 'ns_step1_train.pkl' )#train_val_test = 'train_filter'
         else:
-            self.raw_dir = os.path.join(base_path,'ns_challenge_test.pkl')
+            self.raw_dir = os.path.join(base_path,'ns_step1_test.pkl')
         
         #self.raw_dir = os.path.join(base_path,'nuscenes_' + train_val_test + '.pkl')
         self.challenge_eval = challenge_eval
@@ -97,8 +97,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
                             [
                                 transforms.ToTensor(),
                                 #transforms.Grayscale(),
-                                transforms.Normalize((0.312,0.307,0.377), (0.447,0.447,0.471))
-                                #transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))   #Imagenet
+                                #transforms.Normalize((0.312,0.307,0.377), (0.447,0.447,0.471))
+                                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))   #Imagenet
                                 #transforms.Normalize((0.35), (0.43)), 
                             ]
                         )
@@ -115,7 +115,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_tokens = self.all_tokens[20:]
             '''
         if self.train_val_test == 'train': 
-            with open(os.path.join(base_path,'ns_challenge_val.pkl'), 'rb') as reader:
+            with open(os.path.join(base_path,'ns_step1_val.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
             self.all_feature = np.vstack((self.all_feature, all_feature))
             self.all_adjacency = np.vstack((self.all_adjacency,all_adjacency))
@@ -149,7 +149,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         total_num = len(self.all_feature)
         print(f"{self.train_val_test} split has {total_num} sequences.")
         now_history_frame = self.history_frames - 1
-        feature_id = list(range(0,9)) 
+        feature_id = list(range(0,5)) + [8]
         self.track_info = self.all_feature[:,:,:,13:15]
         self.object_type = self.all_feature[:,:,now_history_frame,8].int()
         self.scene_ids = self.all_feature[:,0,now_history_frame,-3].numpy()
@@ -164,7 +164,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
         ###### Normalize with training statistics to have 0 mean and std=1 #######
         self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
-        #self.node_features[:,:,:,:] = (self.node_features[:,:,:,:] - 0.1579) / 12.4354 # 0.0013) / 4.5471
+        self.node_features[:,:,:,:] = (self.node_features[:,:,:,:] ) / 5 #(challenge 1.06) # 5 normal filetered
         self.node_labels = self.all_feature[:,:,self.history_frames:,:2] 
         #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
 
@@ -203,6 +203,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         
         #img=((maps-maps.min())*255/(maps.max()-maps.min())).numpy()
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img[0].transpose(1,2,0), cv2.COLOR_RGB2BGR))
+        if maps.shape[0] != feats.shape[0]:
+            print('stop')
         scene_id = int(self.scene_ids[idx])
         if self.challenge_eval:
             return graph, output_mask, feats, gt, self.all_tokens[idx], scene_id, self.all_mean_xy[idx,:2], maps            
