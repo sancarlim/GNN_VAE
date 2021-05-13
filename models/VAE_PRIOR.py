@@ -10,10 +10,10 @@ from torchvision.models import resnet18, resnet50
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
 from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
-from models.scout import My_GATLayer, MultiHeadGATLayer
 from models.VAE_GNN import GAT_VAE
 from torchsummary import summary
 
+from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
 class MLP_Enc(nn.Module):
     "Encoder: MLP that takes GNN output as input and returns mu and log variance of the latent distribution."
@@ -82,17 +82,17 @@ class VAE_GNN_prior(nn.Module):
             self.feature_extractor = My_MapEncoder(input_channels = 3, input_size=128, 
                                                     hidden_channels = [16,32,32,64], output_size = hidden_dim, 
                                                     kernels = [5,5,3,3], strides = [1,2,2,2])
-            enc_dims = hidden_dim*2+output_dim    
+            enc_dims = hidden_dim*2+(output_dim-1)    
             dec_dims = z_dim + hidden_dim*2
         
         elif backbone == 'resnet18':       
             self.feature_extractor = ResNet18(hidden_dim, freeze)
-            enc_dims = 2*hidden_dim + output_dim 
+            enc_dims = 2*hidden_dim + (output_dim-1) 
             dec_dims = z_dim + hidden_dim*2
-        elif backbone == 'resnet':       
-            self.feature_extractor = ResNet50(hidden_dim, freeze)
-            enc_dims = 2*hidden_dim + output_dim 
-            dec_dims = z_dim + hidden_dim*2
+        elif backbone == 'resnet50':       
+            self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048]   #self.feature_extractor = ResNet50(hidden_dim, freeze)
+            enc_dims = 2048 + hidden_dim + (output_dim-1)
+            dec_dims = z_dim + hidden_dim + 2048
         
         elif backbone == 'resnet_gray':
             resnet = resnet18(pretrained=False)
@@ -118,15 +118,15 @@ class VAE_GNN_prior(nn.Module):
         #############
         #  ENCODER  #
         #############
-        self.GNN_enc = GAT_VAE(enc_dims,layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
+        self.GNN_enc = GAT_VAE(enc_dims, layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
         encoder_dims = enc_dims*heads
-        self.MLP_encoder = MLP_Enc(encoder_dims+output_dim, z_dim, dropout=dropout)
+        self.MLP_encoder = MLP_Enc(encoder_dims+(output_dim-1), z_dim, dropout=dropout)
         
         #############
         #   PRIOR   #
         #############
-        self.GNN_prior = GAT_VAE(enc_dims-output_dim,layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
-        encoder_dims = (enc_dims-output_dim)*heads
+        self.GNN_prior = GAT_VAE(enc_dims-(output_dim-1),layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
+        encoder_dims = (enc_dims-(output_dim-1))*heads
         self.MLP_prior = MLP_Enc(encoder_dims, z_dim, dropout=dropout)
         
 
@@ -270,7 +270,7 @@ class VAE_GNN_prior(nn.Module):
             h = self.bn_enc(h_prior)
         elif self.gn:
             h = self.gn_enc(h_prior)
-        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    x
+        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
         mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
 
         #### Sample from the latent distribution ###
@@ -286,28 +286,27 @@ class VAE_GNN_prior(nn.Module):
         h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
         h_dec = torch.cat([h_dec, z_sample],dim=-1)
         recon_y = self.MLP_decoder(h_dec)
-        return recon_y, z_sample, mu, log_var, mu_prior, log_var_prior
+        return recon_y,  [mu, log_var, mu_prior, log_var_prior], z_sample
 
 if __name__ == '__main__':
-    history_frames = 4
+    history_frames = 5
     future_frames = 12
     hidden_dims = 128
     heads = 1
 
-    input_dim = 8*history_frames
-    output_dim = 2*future_frames 
+    input_dim = 6*history_frames
+    output_dim = 2*future_frames + 1
 
-    hidden_dims = round(hidden_dims / heads) 
-    model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=1, backbone='resnet')
+    model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet18')
     #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=False, history_frames=history_frames, future_frames=future_frames) 
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
     for batch in test_dataloader:
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps = batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene = batch
         e_w = batched_graph.edata['w']
-        e_w= e_w.unsqueeze(1)
-        y, mu, log_var,_,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
+        #e_w= e_w.unsqueeze(1)
+        y, _,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
         print(y.shape)
 
     
