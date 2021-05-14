@@ -222,13 +222,13 @@ class LitGNN(pl.LightningModule):
             mask = output_masks.expand(output_masks.shape[0],self.future_frames, 2)  #expand mask (B,Tpred,1) -> (B,T_pred,2)
             total_loss = self.mdn_loss(pred, labels,mask.contiguous().view(mask.shape[0],-1).unsqueeze(1).expand_as(pred[1]))  
         else:
-            pred=pred.view(feats.shape[0],self.future_frames,-1)  #(labels.shape[0],self.future_frames,-1)
+            ##pred=pred.view(feats.shape[0],self.future_frames,-1)  #(labels.shape[0],self.future_frames,-1)
             #Socially consistent
             perc_overlap = check_overlap(pred*output_masks) if self.alfa !=0 else 0
-            ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            ##ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
             #overall_sum_time , overall_num, _ = self.compute_RMSE_batch(pred[:,:self.future_frames,:], labels[:,:self.future_frames,:], output_masks[:,self.history_frames:self.total_frames,:])
-            total_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2))*(1+self.alfa*perc_overlap) + self.beta*(fde_error/fde_num.sum(dim = -2))
-            #total_loss = self.mtp_loss(pred, labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
+            ##total_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2))*(1+self.alfa*perc_overlap) + self.beta*(fde_error/fde_num.sum(dim = -2))
+            total_loss = self.mtp_loss(pred, labels.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
 
         # Log metrics
         self.log("Sweep/train_loss",  total_loss, on_step=False, on_epoch=True)
@@ -267,7 +267,7 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats, e_w, rel_type,norm)
         else:
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-            '''
+            
             mode_prob = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             trajectories_no_modes = pred[:, :-NUM_MODES].clone().reshape(desired_shape)
@@ -275,17 +275,17 @@ class LitGNN(pl.LightningModule):
             pred = torch.zeros_like(labels_pos)
             for i, idx in enumerate(best_mode):
                 pred[i] = trajectories_no_modes[i,idx]        
-            '''
+            
 
         if self.probabilistic:
             mask = output_masks.expand(output_masks.shape[0],self.future_frames, 2)  #expand mask (B,Tpred,1) -> (B,T_pred,2)
             total_loss = self.mdn_loss(pred, labels,mask.contiguous().view(mask.shape[0],-1).unsqueeze(1).expand_as(pred[1]))  
         else:
-            pred=pred.view(feats.shape[0],self.future_frames,-1)
+            ##pred=pred.view(feats.shape[0],self.future_frames,-1)
 
             #for debugging purposees - comparing directly with training_loss
-            ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
-            huber_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) + self.beta*(fde_error/fde_num.sum(dim = -2)) 
+            ##ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            ##huber_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) 
 
             #if self.dataset == 'apollo':
             '''
@@ -295,10 +295,9 @@ class LitGNN(pl.LightningModule):
             '''
             
             ade_error, fde_error, overall_num, fde_num, _ = self.compute_RMSE_batch(pred, labels, output_masks)
-            rmse_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) + self.beta*(fde_error/fde_num.sum(dim = -2)) 
-
-        self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
-        #self.log( "Sweep/val_rmse_loss", rmse_loss)   #torch.sum(overall_loss_time).clone().detach()
+            rmse_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) 
+        ##self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
+        self.log( "Sweep/val_rmse_loss", rmse_loss)   #torch.sum(overall_loss_time).clone().detach()
         return rmse_loss
 
     def validation_epoch_end(self, val_loss_over_batches):
@@ -335,8 +334,8 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats,e_w, rel_type,norm)
         else:
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-            pred=pred.view(feats.shape[0],self.future_frames,-1)
-            '''
+            ##pred=pred.view(feats.shape[0],self.future_frames,-1)
+            
             mode_prob = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             trajectories_no_modes = pred[:, :-NUM_MODES].clone().reshape(desired_shape)
@@ -344,7 +343,7 @@ class LitGNN(pl.LightningModule):
             pred = torch.zeros_like(labels_pos)
             for i, idx in enumerate(best_mode):
                 pred[i] = trajectories_no_modes[i,idx] 
-            '''
+            
 
         if self.probabilistic:
             ade = []
@@ -456,7 +455,7 @@ def main(args: Namespace):
 
 
     input_dim_model = input_dim*(history_frames)  #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
-    output_dim = 2 * future_frames #3 * (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
+    output_dim = 3 * (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
 
     if args.model_type == 'gat_mdn':
         #hidden_dims = args.hidden_dims // args.heads

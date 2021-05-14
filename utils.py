@@ -167,35 +167,48 @@ class MTPLoss:
         """
 
         batch_losses = torch.Tensor().requires_grad_(True).to(predictions.device)
-        trajectories, modes = self._get_trajectory_and_modes(predictions)
-        
+        if len(predictions.shape) == 2:
+            trajectories, modes = self._get_trajectory_and_modes(predictions)
+        else:
+            trajectories = predictions[:,:,:-1].clone().view(targets.shape[0], self.num_modes, -1, self.num_location_coordinates_predicted)
+            modes = predictions[:,:,-1].clone().transpose(1,0)
+        '''
         for mode in range(self.num_modes):
             for i in range(1,trajectories.shape[-2]):
                 trajectories[:,mode,i,:] = torch.sum(trajectories[:,mode,i-1:i+1,:],dim=-2) 
         trajectories += last_loc
-        
+        '''
         trajectories = trajectories * mask
         targets = targets * mask
 
-        for batch_idx in range(predictions.shape[0]):
+        for batch_idx in range(targets.shape[0]):
 
-            angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
-                                                            trajectories=trajectories[batch_idx])
+            #angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
+            #                                                trajectories=trajectories[batch_idx])
 
-            best_mode = self._compute_best_mode(angles,
-                                                target=targets[batch_idx],
-                                                trajectories=trajectories[batch_idx])
+            #best_mode = self._compute_best_mode(angles,
+            #                                    target=targets[batch_idx],
+            #                                    trajectories=trajectories[batch_idx])
+            distances_from_ground_truth = []
+            for mode in range(self.num_modes):
+                norm = self._compute_ave_l2_norms(targets[batch_idx] - trajectories[batch_idx][mode, :, :])
+
+                distances_from_ground_truth.append((norm, mode))
+
+            distances_from_ground_truth = sorted(distances_from_ground_truth)
+            best_mode = distances_from_ground_truth[0][1]
+
 
             best_mode_trajectory = trajectories[batch_idx, best_mode, :].unsqueeze(0)
             
             regression_loss = f.smooth_l1_loss(best_mode_trajectory, targets[batch_idx])
-
+            
             mode_probabilities = modes[batch_idx].unsqueeze(0)
             best_mode_target = torch.tensor([best_mode], device=predictions.device)
             classification_loss = f.cross_entropy(mode_probabilities, best_mode_target)
 
             loss = classification_loss + self.regression_loss_weight * regression_loss
-
+            
             batch_losses = torch.cat((batch_losses, loss.unsqueeze(0)), 0)
 
         avg_loss = torch.mean(batch_losses)
@@ -245,7 +258,7 @@ def compute_change_pos(feats,gt, scale_factor):
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
     if scale_factor==1:
-        gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:]*12.4354+0.1579)) * new_mask_gt[:,0:1]
+        gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:] * 5 )) * new_mask_gt[:,0:1]
     else:
         rescale_xy=torch.ones((1,1,2), device=feats.device)*scale_factor
         gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]*rescale_xy) * new_mask_gt[:,0:1]

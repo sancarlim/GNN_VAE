@@ -253,11 +253,11 @@ class SCOUT(nn.Module):
             #self.hidden_dim = hidden_dim + 1280
 
         elif backbone == 'resnet18':       
-            self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #ResNet18(hidden_dim, freeze)  [n, 512]
+            self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #ResNet18(hidden_dim, freeze)  [n, 512] #9 layers (con avgpool) - if freeze=8 train last conv block
             #self.hidden_dim = hidden_dim + hidden_dim * 2
 
         elif backbone == 'resnet50':       
-            self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048] #8 layers
+            self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048] #9 layers
             #self.hidden_dim = hidden_dim + hidden_dim * 2
 
         elif backbone == 'resnet_gray':
@@ -389,8 +389,8 @@ class SCOUT(nn.Module):
         '''
         h=self.dropout_l(h_modes)
         y = self.linear1(h)
-        return y  #return trajectory / final position + probability
-        '''
+        #return y  #return trajectory / final position + probability
+        
         # Normalize the probabilities to sum to 1 for inference.
         mode_probabilities = y[:, -self.num_modes:].clone()
         predictions = y[:, :-self.num_modes]
@@ -399,7 +399,7 @@ class SCOUT(nn.Module):
             mode_probabilities = F.softmax(mode_probabilities, dim=-1)
 
         return torch.cat((predictions, mode_probabilities), 1)
-        '''
+        
 
 if __name__ == '__main__':
 
@@ -408,13 +408,22 @@ if __name__ == '__main__':
     hidden_dims = 768
     heads = 3
 
-    input_dim = 8*history_frames
+    input_dim = 6*history_frames
     output_dim = 2*future_frames 
 
     hidden_dims = hidden_dims // heads
-    model = SCOUT(input_dim=input_dim, hidden_dim=hidden_dims, output_dim=output_dim, heads=heads,  ew_dims= False,
+    model = SCOUT(input_dim=input_dim, hidden_dim=hidden_dims, output_dim=output_dim, heads=heads,  ew_dims= True,
                    dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='resnet50', freeze=True)
     
+
+    g = dgl.graph(([0, 0, 0, 0, 0, 0], [0, 1, 2, 3, 4, 5]))
+    e_w = torch.rand(6, 2)
+    snorm_n = torch.rand(6, 1)
+    snorm_e = torch.rand(6, 1)
+    feats = torch.rand(6, 5, 6)
+    maps = torch.rand(6, 3, 112, 112)
+    out = model(g, feats, e_w,snorm_n,snorm_e,  maps)
+
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=False, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_batch)
