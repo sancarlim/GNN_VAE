@@ -91,7 +91,7 @@ class LitGNN(pl.LightningModule):
         
         return {
             'optimizer': opt,
-            'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt, threshold=0.001, patience=3, verbose=True),
+            'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt, threshold=0.001, patience=4, verbose=True),
             'monitor': "Sweep/val_rmse_loss"
         }
 
@@ -156,15 +156,19 @@ class LitGNN(pl.LightningModule):
         pred = pred*mask #B*V,T,C - B grafos en el batch con V_i (variable) nodos cada uno
         gt = gt*mask  # outputmask BV,T,C
         #x2y2_error= torch.sum(torch.where(torch.abs(gt-pred) > 1 , (gt-pred)**2, torch.abs(gt - pred)), dim=-1) 
-        error=torch.sum((pred-gt)**2,dim=-1) # x^2+y^2 BV,T  PROBABILISTIC -> gt[:,:,:2]
+        x2y2_error = torch.sum((pred-gt)**2,dim=-1) # x^2+y^2 BV,T  PROBABILISTIC -> gt[:,:,:2]
+
         with torch.no_grad():
             index = torch.tensor( [ mask_i.nonzero()[-1][0] if mask_i.any() else 0 for mask_i in mask.squeeze() ], device=pred.device)
         
-        x2y2_error = error[torch.arange(gt.shape[0]),index].unsqueeze(1) 
-        overall_sum_time = (x2y2_error**0.5).sum(dim=-2)  #T - suma de los errores (x^2+y^2) de los BV agentes
-        overall_num = mask[torch.arange(gt.shape[0]),index] #.sum(-1)  #torch.Tensor[(BV,T)] - num de agentes (Y CON DATOS) en cada frame
+        fde_error = (x2y2_error[torch.arange(gt.shape[0]),index]**0.5).unsqueeze(1).sum(dim=-2) 
+        ade_error = (x2y2_error**0.5).sum(dim=-2)  #T - suma de los errores (x^2+y^2) de los BV agentes
 
-        return overall_sum_time, overall_num, x2y2_error
+        overall_num = mask.sum(dim = -1)  #torch.Tensor[(BV,T)] - num de agentes (Y CON DATOS) en cada frame
+        fde_num = mask[torch.arange(gt.shape[0]),index]
+
+        return ade_error, fde_error, overall_num, fde_num, x2y2_error
+
 
     def huber_loss(self, pred, gt, mask, delta):
         pred = pred*mask #B*V,T,C 
@@ -173,13 +177,14 @@ class LitGNN(pl.LightningModule):
         huber_error = torch.sum(torch.where(torch.abs(gt-pred) < delta , (0.5*(gt-pred)**2), torch.abs(gt - pred)*delta - 0.5*(delta**2)), dim=-1) 
         
         with torch.no_grad():
-            index = torch.tensor( [ mask_i.nonzero()[-1][0] if mask_i.any() else 0 for mask_i in mask.squeeze() ], device=huber_error.device)
+            index = torch.tensor( [ mask_i.nonzero()[-1][0] if mask_i.any() else 0 for mask_i in mask.squeeze() ], device=huber_error.device) #pick last frame with gt data
         
-        error =  huber_error[torch.arange(gt.shape[0]),index].unsqueeze(1) 
-        overall_sum_time = error.sum(dim=-2) #T - suma de los errores de los BV agentes
+        fde_error =  huber_error[torch.arange(gt.shape[0]),index].unsqueeze(1).sum(dim=-2)
+        ade_error = huber_error.sum(dim=-2) #T - suma de los errores de los BV agentes
 
-        overall_num = mask[torch.arange(gt.shape[0]),index] #.sum(-1)
-        return overall_sum_time, overall_num
+        overall_num = mask.sum(dim = -1)
+        fde_num = mask[torch.arange(gt.shape[0]),index]
+        return ade_error, fde_error, overall_num, fde_num
 
 
 
@@ -220,9 +225,9 @@ class LitGNN(pl.LightningModule):
             pred=pred.view(feats.shape[0],self.future_frames,-1)  #(labels.shape[0],self.future_frames,-1)
             #Socially consistent
             perc_overlap = check_overlap(pred*output_masks) if self.alfa !=0 else 0
-            overall_sum_time, overall_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
             #overall_sum_time , overall_num, _ = self.compute_RMSE_batch(pred[:,:self.future_frames,:], labels[:,:self.future_frames,:], output_masks[:,self.history_frames:self.total_frames,:])
-            total_loss = torch.sum(overall_sum_time)/torch.sum(overall_num.sum(dim=-2))*(1+self.alfa*perc_overlap) + self.beta*(overall_sum_time[-1]/overall_num.sum(dim=-2)[-1])
+            total_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2))*(1+self.alfa*perc_overlap) + self.beta*(fde_error/fde_num.sum(dim = -2))
             #total_loss = self.mtp_loss(pred, labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
 
         # Log metrics
@@ -279,8 +284,8 @@ class LitGNN(pl.LightningModule):
             pred=pred.view(feats.shape[0],self.future_frames,-1)
 
             #for debugging purposees - comparing directly with training_loss
-            overall_sum_time, overall_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
-            huber_loss = torch.sum(overall_sum_time)/torch.sum(overall_num.sum(dim=-2))
+            ade_error, fde_error, overall_num, fde_num = self.huber_loss(pred, labels, output_masks, self.delta)  #(B,6)
+            huber_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) + self.beta*(fde_error/fde_num.sum(dim = -2)) 
 
             #if self.dataset == 'apollo':
             '''
@@ -289,9 +294,8 @@ class LitGNN(pl.LightningModule):
             pred += last_loc
             '''
             
-            _ , overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels, output_masks)
-            rmse_loss = torch.sum(torch.sum((x2y2_error**0.5), dim=0)) / torch.sum(overall_num.sum(dim=-2)) #/ self.future_frames #T->1
-
+            ade_error, fde_error, overall_num, fde_num, _ = self.compute_RMSE_batch(pred, labels, output_masks)
+            rmse_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) + self.beta*(fde_error/fde_num.sum(dim = -2)) 
 
         self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
         #self.log( "Sweep/val_rmse_loss", rmse_loss)   #torch.sum(overall_loss_time).clone().detach()
@@ -379,9 +383,9 @@ class LitGNN(pl.LightningModule):
             #    pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
             pred += last_loc
 
-            _, overall_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos, output_masks)
+            ade_error, fde_error, overall_num, fde_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos, output_masks)
             long_err, lat_err, _ = compute_long_lat_error(pred, labels_pos, output_masks)
-            overall_loss_time = torch.sum((x2y2_error**0.5),dim=0) / torch.sum(overall_num, dim=0)#T
+            overall_loss_time = ade_error / torch.sum(overall_num, dim=0)#T
             overall_loss_time[torch.isnan(overall_loss_time)]=0
             overall_long_err = torch.sum(long_err.detach(),dim=0) / torch.sum(overall_num, dim=0) #T
             overall_lat_err = torch.sum(lat_err.detach(),dim=0) / torch.sum(overall_num, dim=0) #T
@@ -390,13 +394,13 @@ class LitGNN(pl.LightningModule):
             self.overall_loss_time_list.append(overall_loss_time.detach().cpu().numpy())
             self.overall_long_err_list.append(overall_long_err.detach().cpu().numpy())
             self.overall_lat_err_list.append(overall_lat_err.detach().cpu().numpy())
-            '''
+            
             if self.future_frames == 8:
                 self.log_dict({'Sweep/test_loss': torch.sum(overall_loss_time), "test/loss_1": overall_loss_time[1:2], "test/loss_2": overall_loss_time[4:5], "test/loss_2.5": overall_loss_time[6:7], "test/loss_3.2": overall_loss_time[-1:] })
             else:
                 self.log_dict({'Sweep/test_loss': torch.sum(overall_loss_time)/self.future_frames, "test/loss_1": overall_loss_time[1:2], "test/loss_2": overall_loss_time[3:4], "test/loss_3": overall_loss_time[5:6], "test/loss_4": overall_loss_time[7:8], "test/loss_5": overall_loss_time[9:10], "test/loss_6": overall_loss_time[11:] }) #, sync_dist=True
-            '''
-            self.log('Sweep/loss_6', torch.sum(overall_loss_time))
+            
+            #self.log('Sweep/loss_6', torch.sum(overall_loss_time))
 
     def on_test_epoch_end(self):
         #wandb_logger.experiment.save(run.name + '.ckpt')
@@ -477,7 +481,7 @@ def main(args: Namespace):
                         beta = args.beta, delta=args.delta, prob=args.probabilistic, dataset=args.dataset, train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, 
                         mask=args.mask, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, wandb = not args.nowandb)  
 
-    early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=6)
+    early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=10)
 
     if not args.nowandb:
         run=wandb.init(job_type="training", entity='sandracl72', project='nuscenes', sync_tensorboard=True)  
