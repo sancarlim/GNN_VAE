@@ -9,6 +9,12 @@ import random
 
 from torch.nn import functional as f
 
+import sys
+sys.path.append('/home/sandra/PROGRAMAS/nuscenes-devkit/python-sdk/')
+import nuscenes 
+from nuscenes.eval.common.utils import quaternion_yaw, angle_diff
+from pyquaternion import Quaternion
+
 
 class MTPLoss:
     """ Computes the loss for the MTP model. """
@@ -167,6 +173,8 @@ class MTPLoss:
         """
 
         batch_losses = torch.Tensor().requires_grad_(True).to(predictions.device)
+        class_losses = torch.Tensor().to(predictions.device)
+        regression_losses = torch.Tensor().to(predictions.device)
         if len(predictions.shape) == 2:
             trajectories, modes = self._get_trajectory_and_modes(predictions)
         else:
@@ -210,10 +218,15 @@ class MTPLoss:
             loss = classification_loss + self.regression_loss_weight * regression_loss
             
             batch_losses = torch.cat((batch_losses, loss.unsqueeze(0)), 0)
+            class_losses = torch.cat((class_losses, classification_loss.unsqueeze(0)), 0)
+            regression_losses = torch.cat((regression_losses, regression_loss.unsqueeze(0)), 0)
 
         avg_loss = torch.mean(batch_losses)
 
-        return avg_loss
+        regression_avg_loss = torch.mean(regression_losses)
+        class_avg_loss = torch.mean(class_losses)
+
+        return avg_loss, regression_avg_loss, class_avg_loss
 
 
 
@@ -307,10 +320,29 @@ def compute_long_lat_error(pred,gt,mask):
     return lateral_error, long_error, overall_num
 
 
-'''
+def make_2d_rotation_matrix(angle_in_radians: float) -> np.ndarray:
+    """
+    Makes rotation matrix to rotate point in x-y plane counterclockwise
+    by angle_in_radians.
+    """
+
+    return np.array([[np.cos(angle_in_radians), -np.sin(angle_in_radians)],
+                     [np.sin(angle_in_radians), np.cos(angle_in_radians)]])
+
+
+def angle_of_rotation(yaw: float) -> float:
+    """
+    Given a yaw angle (measured from x axis), find the angle needed to rotate by so that
+    the yaw is aligned with the y axis (pi / 2).
+    :param yaw: Radians. Output of quaternion_yaw function.
+    :return: Angle in radians.
+    """
+    return (np.pi / 2) + np.sign(-yaw) * np.abs(yaw)
+
+
 def convert_global_coords_to_local(coordinates: np.ndarray,
                                    translation: Tuple[float, float, float],
-                                   rotation: Tuple[float, float, float, float]) -> np.ndarray:
+                                   yaw: Tuple[float, float, float, float], history: bool) -> np.ndarray:
     """
     Converts global coordinates to coordinates in the frame given by the rotation quaternion and
     centered at the translation vector. The rotation is meant to be a z-axis rotation.
@@ -320,12 +352,17 @@ def convert_global_coords_to_local(coordinates: np.ndarray,
         Representation - cos(theta / 2) + (xi + yi + zi)sin(theta / 2).
     :return: x,y locations in frame stored in array of share [n_times, 2].
     """
-    yaw = angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
+    yaw = angle_of_rotation(yaw) #(quaternion_yaw(Quaternion(rotation)))
 
     transform = make_2d_rotation_matrix(angle_in_radians=yaw)
 
     coords = (coordinates - np.atleast_2d(np.array(translation)[:2])).T
+    new_coords = np.zeros((5, 2))
+    transformed = np.dot(transform, coords).T[:, :2]
+    if history:
+        for i in range(len(transformed)):
+            new_coords[-1-i] = transformed[-1-i]
+        return new_coords
+        
+    return transformed
 
-    return np.dot(transform, coords).T[:, :2]
-
-'''

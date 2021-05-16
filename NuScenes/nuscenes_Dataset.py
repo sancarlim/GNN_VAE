@@ -10,11 +10,10 @@ from torch.utils.data import DataLoader
 from torchvision import transforms, utils
 from torchvision.transforms import functional as trans_fn
 import os
-import utils
+from utils import convert_global_coords_to_local
 os.environ['DGLBACKEND'] = 'pytorch'
 from torchvision import transforms
 import scipy.sparse as spp
-from dgl.data import DGLDataset
 from sklearn.preprocessing import StandardScaler
 import cv2
 
@@ -75,7 +74,7 @@ def collate_batch(samples):
 class nuscenes_Dataset(torch.utils.data.Dataset):
 
     def __init__(self, train_val_test='train', history_frames=history_frames, future_frames=future_frames, 
-                    rel_types=True, challenge_eval=False):
+                    rel_types=True, challenge_eval=False, local_frame = True):
         '''
             :classes:   categories to take into account
             :rel_types: wether to include relationship types in edge features 
@@ -85,7 +84,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         self.map_path = os.path.join(base_path, 'hd_maps_ego') 
         self.future_frames = future_frames
         self.types = rel_types
-        
+        self.local_frame = local_frame
+
         if train_val_test == 'train':
             self.raw_dir =os.path.join(base_path, 'ns_step1_train.pkl' )#train_val_test = 'train_filter'
         else:
@@ -149,26 +149,36 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         total_num = len(self.all_feature)
         print(f"{self.train_val_test} split has {total_num} sequences.")
         now_history_frame = self.history_frames - 1
-        feature_id = list(range(0,5)) + [8]
+        feature_id = list(range(0,5)) + [8] + [-2]
         self.track_info = self.all_feature[:,:,:,13:15]
         self.object_type = self.all_feature[:,:,now_history_frame,8].int()
         self.scene_ids = self.all_feature[:,0,now_history_frame,-3].numpy()
         self.all_scenes = np.unique(self.scene_ids)
         self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
-        self.output_mask= self.all_feature[:,:,self.history_frames:,-2].unsqueeze_(-1)
+        self.output_mask= self.all_feature[:,:,:,-2].unsqueeze_(-1)
         
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  
         #rescale_xy[:,:,:,1] = torch.max(abs(self.all_feature[:,:,:,1]))  
         #rescale_xy=torch.ones((1,1,1,2))*10
         #self.all_feature[:,:,:self.history_frames,:2] = self.all_feature[:,:,:self.history_frames,:2]/rescale_xy
+        self.xy_dist=[spatial.distance.cdist(self.all_feature[i][:,now_history_frame,:2], self.all_feature[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
+        
+        all_feature = self.all_feature.clone()
+        # Convert history to local coordinates
+        if self.local_frame:
+            for seq in range(self.all_feature.shape[0]):
+                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) if mask_i.any() else 0 for mask_i in self.output_mask[seq,:self.num_visible_object[seq]-1,:self.history_frames,:2].squeeze(dim=-1) ])
+                all_feature[seq,:self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq]-1)])
+                all_feature[seq,:self.num_visible_object[seq]-1,history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq]-1)])
 
         ###### Normalize with training statistics to have 0 mean and std=1 #######
-        self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
-        self.node_features[:,:,:,:] = (self.node_features[:,:,:,:] ) / 5 #(challenge 1.06) # 5 normal filetered
-        self.node_labels = self.all_feature[:,:,self.history_frames:,:2] 
+        self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+        self.node_labels = all_feature[:,:,self.history_frames:,:2] 
         #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
+        
+        if not self.local_frame:
+            self.node_features = (self.node_features) / 5 #(challenge 1.06) # 5 normal filetered
 
-        self.xy_dist=[spatial.distance.cdist(self.all_feature[i][:,now_history_frame,:2], self.node_features[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
         
     def __len__(self):
             return len(self.all_feature)
@@ -194,7 +204,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
         feats = self.node_features[idx, :self.num_visible_object[idx]]
         gt = self.node_labels[idx, :self.num_visible_object[idx]]
-        output_mask = self.output_mask[idx, :self.num_visible_object[idx]]
+        output_mask = self.output_mask[idx, :self.num_visible_object[idx], self.history_frames:]
 
         sample_token=str(self.all_tokens[idx][0,1])
         with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
