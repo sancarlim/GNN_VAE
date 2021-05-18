@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms, utils
 from torchvision.transforms import functional as trans_fn
 import os
-from utils import convert_global_coords_to_local
+from utils import convert_global_coords_to_local, convert_local_coords_to_global
 os.environ['DGLBACKEND'] = 'pytorch'
 from torchvision import transforms
 import scipy.sparse as spp
@@ -157,27 +157,34 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
         self.output_mask= self.all_feature[:,:,:,-2].unsqueeze_(-1)
         
+        
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  
         #rescale_xy[:,:,:,1] = torch.max(abs(self.all_feature[:,:,:,1]))  
         #rescale_xy=torch.ones((1,1,1,2))*10
         #self.all_feature[:,:,:self.history_frames,:2] = self.all_feature[:,:,:self.history_frames,:2]/rescale_xy
         self.xy_dist=[spatial.distance.cdist(self.all_feature[i][:,now_history_frame,:2], self.all_feature[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
         
-        all_feature = self.all_feature.clone()
         # Convert history to local coordinates
         if self.local_frame:
+            all_feature = self.all_feature.clone()
             for seq in range(self.all_feature.shape[0]):
-                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) if mask_i.any() else 0 for mask_i in self.output_mask[seq,:self.num_visible_object[seq]-1,:self.history_frames,:2].squeeze(dim=-1) ])
-                all_feature[seq,:self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq]-1)])
-                all_feature[seq,:self.num_visible_object[seq]-1,history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq]-1)])
+                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) if mask_i.any() else 0 for mask_i in self.output_mask[seq,:self.num_visible_object[seq],:self.history_frames,:2].squeeze(dim=-1) ])
+                all_feature[seq,:self.num_visible_object[seq],:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq])])
+                all_feature[seq,:self.num_visible_object[seq],history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq])])
 
-        ###### Normalize with training statistics to have 0 mean and std=1 #######
-        self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
-        self.node_labels = all_feature[:,:,self.history_frames:,:2] 
-        #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
-        
-        if not self.local_frame:
+            self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+            self.node_labels = all_feature[:,:,self.history_frames:,:2] 
+        else:
+            ###### Normalize with training statistics to have 0 mean and std=1 #######
+            self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
             self.node_features = (self.node_features) / 5 #(challenge 1.06) # 5 normal filetered
+            self.node_labels = self.all_feature[:,:,self.history_frames:,:2] 
+            #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
+
+        #For visualization
+        self.global_features = self.all_feature[:,:,:self.history_frames,feature_id]
+
+            
 
         
     def __len__(self):
@@ -206,6 +213,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         gt = self.node_labels[idx, :self.num_visible_object[idx]]
         output_mask = self.output_mask[idx, :self.num_visible_object[idx], self.history_frames:]
 
+        # Include ego in feats and labels
+        feats[-1,:,-1] = 1
+        self.output_mask[idx, self.num_visible_object[idx]-1, self.history_frames:] = 1
+
         sample_token=str(self.all_tokens[idx][0,1])
         with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
@@ -217,7 +228,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             print('stop')
         scene_id = int(self.scene_ids[idx])
         if self.challenge_eval:
-            return graph, output_mask, feats, gt, self.all_tokens[idx], scene_id, self.all_mean_xy[idx,:2], maps            
+            return graph, output_mask, feats, gt, self.all_tokens[idx], scene_id, self.all_mean_xy[idx,:2], maps , self.global_features[idx,:self.num_visible_object[idx],:,:2]
             
         return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx])
 
