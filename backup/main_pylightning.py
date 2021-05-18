@@ -22,7 +22,9 @@ from models.Gated_GCN import GatedGCN
 from models.RGCN import RGCN
 import wandb
 import pytorch_lightning as pl
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks import StochasticWeightAveraging
 from pytorch_lightning import seed_everything
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -88,11 +90,10 @@ class LitGNN(pl.LightningModule):
         opt = torch.optim.AdamW([
                 {'params': self.model.base.parameters()},
                 {'params': self.model.embeddings.parameters(), 'lr': self.lr1}], lr=self.lr2, weight_decay=self.wd)
-
-        
+    
         return {
             'optimizer': opt,
-            'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt, threshold=0.001, patience=4, verbose=True),
+            'lr_scheduler': LinearWarmupCosineAnnealingLR(opt, warmup_epochs=10, max_epochs=40),   ##torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt, threshold=0.001, patience=4, verbose=True),
             'monitor': "Sweep/val_rmse_loss"
         }
 
@@ -235,7 +236,7 @@ class LitGNN(pl.LightningModule):
 
         # Log metrics
         #self.log("Sweep/train_loss",  total_loss, on_step=False, on_epoch=True)
-        self.log_dict({"Sweep/train_loss",  total_loss,  "Sweep/train_huber_loss": regression_loss, "Sweep/rain_class_loss": class_loss}, on_step=False, on_epoch=True)
+        self.log_dict({"Sweep/train_loss":  total_loss,  "Sweep/train_huber_loss": regression_loss, "Sweep/rain_class_loss": class_loss}, on_step=False, on_epoch=True)
         return total_loss
 
     def validation_step(self, val_batch, batch_idx):
@@ -272,14 +273,15 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats, e_w, rel_type,norm)
         else:
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-            
+            '''
             mode_prob = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             trajectories_no_modes = pred[:, :-NUM_MODES].clone().reshape(desired_shape)
             best_mode = np.argmax(mode_prob.detach().cpu().numpy(), axis = 1)
             pred = torch.zeros_like(labels)
             for i, idx in enumerate(best_mode):
-                pred[i] = trajectories_no_modes[i,idx]        
+                pred[i] = trajectories_no_modes[i,idx]     
+            '''   
             
 
         if self.probabilistic:
@@ -298,11 +300,13 @@ class LitGNN(pl.LightningModule):
                     pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
                 pred += last_loc
             
-            ade_error, fde_error, overall_num, fde_num, _ = self.compute_RMSE_batch(pred, labels, output_masks)
-            rmse_loss = torch.sum(ade_error)/torch.sum(overall_num.sum(dim=-2)) 
-        ##self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
-        self.log( "Sweep/val_rmse_loss", rmse_loss)   #torch.sum(overall_loss_time).clone().detach()
-        return rmse_loss
+            ##ade_error, fde_error, overall_num, fde_num, _ = self.compute_RMSE_batch(pred, labels, output_masks)
+            ##rmse_loss = torch.sum(ade_error/overall_num.sum(dim=-2)) 
+            total_loss, regression_loss, class_loss = self.mtp_loss(pred, labels.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
+
+        self.log_dict({"Sweep/val_class_loss": class_loss, "Sweep/val_rmse_loss": regression_loss})
+        #self.log( "Sweep/val_rmse_loss", rmse_loss)   #torch.sum(overall_loss_time).clone().detach()
+        return regression_loss
 
     def validation_epoch_end(self, val_loss_over_batches):
         #log best val loss
@@ -340,6 +344,8 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
             ##pred=pred.view(feats.shape[0],self.future_frames,-1)
             
+            avg_loss, regression_loss, class_loss = self.mtp_loss(pred, labels.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1))
+
             mode_prob = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             trajectories_no_modes = pred[:, :-NUM_MODES].clone().reshape(desired_shape)
@@ -461,7 +467,7 @@ def main(args: Namespace):
         input_dim = 7
 
 
-    input_dim_model = input_dim*(history_frames -1)  #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
+    input_dim_model = input_dim*(history_frames -1) if args.local_frame else input_dim * history_frames #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
     output_dim = (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
 
     if args.model_type == 'gat_mdn':
@@ -487,7 +493,7 @@ def main(args: Namespace):
                         beta = args.beta, delta=args.delta, prob=args.probabilistic, dataset=args.dataset, train_dataset=train_dataset, val_dataset=test_dataset, test_dataset=test_dataset, 
                         local_frame = args.local_frame, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, wandb = not args.nowandb)  
 
-    early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=12)
+    early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=10)
 
     if not args.nowandb:
         run=wandb.init(job_type="training", entity='sandracl72', project='nuscenes', sync_tensorboard=True)  
@@ -503,12 +509,14 @@ def main(args: Namespace):
     else:
         tb_logger = pl_loggers.TensorBoardLogger('tb_logs', name='my_model', log_graph=True)
         checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_rmse_loss', mode='min', dirpath='/media/14TBDISK/sandra/logs/',filename='nowandb-{epoch:02d}.ckpt')
+        swa_callback = StochasticWeightAveraging(swa_epoch_start = 17)
         trainer = pl.Trainer( stochastic_weight_avg=True, weights_summary='full', gpus=args.gpus, deterministic=False, precision=16, callbacks=[early_stop_callback,checkpoint_callback], profiler=True) 
 
 
     if args.ckpt is not None:
         LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
-                     dataset = 'nuscenes',train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor)
+                     dataset = 'nuscenes',train_dataset=train_dataset, val_dataset=test_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor,
+                     local_frame = args.local_frame)
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler=True)
         trainer.test(LitGNN_sys)
@@ -532,7 +540,7 @@ if __name__ == '__main__':
     parser.add_argument("--lr2", type=float, default=1e-3, help="Adam: Base learning rate")
     parser.add_argument("--wd", type=float, default=0.01, help="Adam: weight decay")
     parser.add_argument("--batch_size", type=int, default=512, help="Size of the batches")
-    parser.add_argument("--hidden_dims", type=int, default=1024)
+    parser.add_argument("--hidden_dims", type=int, default=512)
     parser.add_argument("--model_type", type=str, default='gat', help="Choose model type / aggregation function.")
     parser.add_argument("--dataset", type=str, default='nuscenes', help="Choose dataset.",
                                         choices=['nuscenes', 'ind', 'apollo'])

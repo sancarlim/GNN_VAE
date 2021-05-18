@@ -90,13 +90,14 @@ class MTPLoss:
         return angle
 
     @staticmethod
-    def _compute_ave_l2_norms(tensor: torch.Tensor) -> float:
+    def _compute_ave_l2_norms(tensor: torch.Tensor, mask: torch.Tensor) -> float:
         """
         Compute the average of l2 norms of each row in the tensor.
         :param tensor: Shape [1, n_timesteps, 2].
         :return: Average l2 norm. Float.
         """
-        l2_norms = torch.norm(tensor, p=2, dim=2)
+        # Don't take into account frames without gt.
+        l2_norms = torch.norm(tensor[:mask.nonzero()[-1]+1], p=2, dim=2)
         avg_distance = torch.mean(l2_norms)
         return avg_distance.item()
 
@@ -189,7 +190,7 @@ class MTPLoss:
         trajectories = trajectories * mask
         targets = targets * mask
 
-        for batch_idx in range(targets.shape[0]):
+        for batch_idx in range(targets.shape[0]): #-1 to not take into account ego
 
             #angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
             #                                                trajectories=trajectories[batch_idx])
@@ -197,9 +198,13 @@ class MTPLoss:
             #best_mode = self._compute_best_mode(angles,
             #                                    target=targets[batch_idx],
             #                                    trajectories=trajectories[batch_idx])
+            
+            if not mask[batch_idx].squeeze().any():
+                continue
+
             distances_from_ground_truth = []
             for mode in range(self.num_modes):
-                norm = self._compute_ave_l2_norms(targets[batch_idx] - trajectories[batch_idx][mode, :, :])
+                norm = self._compute_ave_l2_norms(targets[batch_idx] - trajectories[batch_idx][mode, :, :], mask[batch_idx].squeeze())
 
                 distances_from_ground_truth.append((norm, mode))
 
@@ -222,7 +227,6 @@ class MTPLoss:
             regression_losses = torch.cat((regression_losses, regression_loss.unsqueeze(0)), 0)
 
         avg_loss = torch.mean(batch_losses)
-
         regression_avg_loss = torch.mean(regression_losses)
         class_avg_loss = torch.mean(class_losses)
 
@@ -366,3 +370,19 @@ def convert_global_coords_to_local(coordinates: np.ndarray,
         
     return transformed
 
+def convert_local_coords_to_global(coordinates: np.ndarray,
+                                   translation: Tuple[float, float, float],
+                                   rotation: Tuple[float, float, float, float]) -> np.ndarray:
+    """
+    Converts local coordinates to global coordinates.
+    :param coordinates: x,y locations. array of shape [n_steps, 2]
+    :param translation: Tuple of (x, y, z) location that is the center of the new frame
+    :param rotation: Tuple representation of quaternion of new frame.
+        Representation - cos(theta / 2) + (xi + yi + zi)sin(theta / 2).
+    :return: x,y locations stored in array of share [n_times, 2].
+    """
+    yaw = angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
+
+    transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
+
+    return np.dot(transform, coordinates.cpu().numpy().T).T[:, :2] + np.atleast_2d(np.array(translation)[:2])
