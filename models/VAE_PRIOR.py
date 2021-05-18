@@ -15,6 +15,8 @@ from torchsummary import summary
 
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
+NUM_MODES = 3
+
 class MLP_Enc(nn.Module):
     "Encoder: MLP that takes GNN output as input and returns mu and log variance of the latent distribution."
     "The stddev of the distribution is treated as the log of the variance of the normal distribution for numerical stability."
@@ -191,6 +193,55 @@ class VAE_GNN_prior(nn.Module):
         eps = torch.randn_like(std)
         return mean + std * eps
 
+    
+    def encode(self, g, h_emb, e_w, snorm_n, maps_emb, gt):
+        # Embeddings concatenation
+        h = torch.cat([maps_emb, h_emb, gt], dim=-1)
+        #h = self.linear_cat(h)
+
+        if self.bn:
+            h = self.bn_enc(h)
+        elif self.gn:
+            h = self.gn_enc(h)
+
+        h = self.GNN_enc(g, h, e_w, snorm_n)
+        h = torch.cat([h, gt], dim=-1)            
+        mu, log_var = self.MLP_encoder(h)   # Latent distribution
+        
+        return mu, log_var
+    
+    def prior(self, g, h_emb, e_w, snorm_n, maps_emb):
+        # Embeddings concatenation
+        h_prior = torch.cat([maps_emb, h_emb], dim=-1)
+        #h = self.linear_cat(h)
+
+        if self.bn:
+            h = self.bn_enc(h_prior)
+        elif self.gn:
+            h = self.gn_enc(h_prior)
+
+        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
+
+        mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
+
+        return mu_prior, log_var_prior
+        
+    
+    def decode(self, g, h_emb, e_w, snorm_n, maps_emb, z_sample):   
+        #h_dec = self.embedding_z(z_sample)       
+        h_dec = torch.cat([maps_emb, h_emb, z_sample],dim=-1)
+        
+        if self.bn:
+            h = self.bn_dec(h_dec)
+        elif self.gn:
+            h = self.gn_dec(h_dec)
+            
+        h = self.GNN_decoder(g,h_dec,e_w,snorm_n)
+        h = torch.cat([h, z_sample],dim=-1)
+
+        return self.MLP_decoder(h) 
+
+    
     def inference(self, g, feats, e_w, snorm_n,snorm_e, maps):
         """
         Samples from a normal distribution and decodes conditioned to the GNN outputs.   
@@ -205,38 +256,13 @@ class VAE_GNN_prior(nn.Module):
         maps_emb = self.feature_extractor(maps)
 
         #### PRIOR ####
-        # Embeddings concatenation
-        h_prior = torch.cat([maps_emb.flatten(start_dim=1), h_emb], dim=-1)
-
-        #h = self.linear_cat(h)
-        if self.bn:
-            h = self.bn_enc(h_prior)
-        elif self.gn:
-            h = self.gn_enc(h_prior)
-
-        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
-
-        mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
-
-        #### Sample from the latent distribution ###
-        z_sample = self.reparameterize(mu_prior, log_var_prior)
+        z_sample, mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
         
         #### DECODE ####      
-        #z_dec = self.embedding_z(z_sample)      
-        h_dec = torch.cat([maps_emb.flatten(start_dim=1), h_emb, z_sample],dim=-1)
+        recon_y = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
 
-        if self.bn:
-            h_dec = self.bn_dec(h_dec)
-        elif self.gn:
-            h_dec = self.gn_dec(h_dec) 
+        return recon_y
 
-        h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
-
-        h_dec = torch.cat([h_dec, z_sample],dim=-1)
-
-        recon_y = self.MLP_decoder(h_dec)
-
-        return recon_y, mu_prior, log_var_prior
  
     def forward(self, g, feats, e_w, snorm_n, snorm_e, gt, maps):
         # Reshape from (B*V,T,C) to (B*V,T*C) 
@@ -251,42 +277,21 @@ class VAE_GNN_prior(nn.Module):
         h_emb = self.embedding_h(feats) 
 
         #### ENCODER ####
-        # Embeddings concatenation
-        h = torch.cat([maps_emb, h_emb, gt], dim=-1)
-        #h = self.linear_cat(h)
-        if self.bn:
-            h = self.bn_enc(h)
-        elif self.gn:
-            h = self.gn_enc(h)
-        h = self.GNN_enc(g, h, e_w, snorm_n)
-        h = torch.cat([h, gt], dim=-1)            
-        mu, log_var = self.MLP_encoder(h)   # Latent distribution
+        mu, log_var = self.encode(g, h_emb, e_w, snorm_n, maps_emb, gt)
 
         #### PRIOR ####
-        # Embeddings concatenation
-        h_prior = torch.cat([maps_emb, h_emb], dim=-1)
-        #h = self.linear_cat(h)
-        if self.bn:
-            h = self.bn_enc(h_prior)
-        elif self.gn:
-            h = self.gn_enc(h_prior)
-        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
-        mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
+        mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
-        #### Sample from the latent distribution ###
-        z_sample = self.reparameterize(mu_prior, log_var_prior)
-        
         #### DECODE ####      
-        #h_dec = self.embedding_z(z_sample)       
-        h_dec = torch.cat([maps_emb.flatten(start_dim=1), h_emb, z_sample],dim=-1)
-        if self.bn:
-            h = self.bn_dec(h_dec)
-        elif self.gn:
-            h = self.gn_dec(h_dec)
-        h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
-        h_dec = torch.cat([h_dec, z_sample],dim=-1)
-        recon_y = self.MLP_decoder(h_dec)
-        return recon_y,  [mu, log_var, mu_prior, log_var_prior], z_sample
+        pred = torch.Tensor().requires_grad_(True).to(feats.device)
+        std = torch.exp(0.5 * log_var_prior)
+
+        for i in range(NUM_MODES):
+            #### Sample from the latent distribution ###
+            z_sample = self.reparameterize(mu_prior, log_var_prior)
+            pred = torch.cat( [pred, self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample).unsqueeze(0)],  dim = 0) # 3, N, 25
+
+        return pred[:,:,:-1], pred[:,:,-1], torch.stack((mu, log_var, mu_prior, log_var_prior), 1), z_sample
 
 if __name__ == '__main__':
     history_frames = 5
@@ -302,11 +307,12 @@ if __name__ == '__main__':
     test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
+
     for batch in test_dataloader:
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene = batch
         e_w = batched_graph.edata['w']
         #e_w= e_w.unsqueeze(1)
-        y, _,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
+        y, prob,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
         print(y.shape)
 
     
