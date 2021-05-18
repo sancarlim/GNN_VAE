@@ -23,6 +23,8 @@ from torch.distributions.kl import kl_divergence
 from torch.distributions.normal import Normal
 from utils import str2bool, compute_change_pos, plot_grad_flow, MTPLoss
 
+from torch import autograd
+
 FREQUENCY = 2
 dt = 1 / FREQUENCY
 history = 2
@@ -30,9 +32,11 @@ future = 6
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames #2s of history + 6s of prediction
-input_dim_model = (history_frames)*6 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
+input_dim_model = (history_frames - 1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 + 1 #Uncertainity measure.
 NUM_MODES = 3
+
+autograd.set_detect_anomaly(True) 
 
 def collate_batch_test(samples):
     graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
@@ -56,7 +60,7 @@ class LitGNN(pl.LightningModule):
                     lr1: float = 1e-3, lr2: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, delta: float = 1., 
                     rel_types: bool = False, scale_factor: int = 1, wandb : bool = True, decay_rate: float = 0.96, 
                     reconstruction_loss: str = 'huber',  gamma: float = 0.01, beta_period: float = 4, beta_ratio_annealing: float = 0.5,
-                    beta_max_value: float = 1, model_type: str = 'vae_gat', classification_loss_weight: float = 1., z_dim: int = 25):
+                    beta_max_value: float = 1, model_type: str = 'vae_gat', classification_loss_weight: float = 1., z_dim: int = 25, local_frame: bool = True):
         super().__init__()
         self.model= model
         self.lr1 = lr1
@@ -88,6 +92,7 @@ class LitGNN(pl.LightningModule):
         self.classification_loss_weight = classification_loss_weight
         self.z_dim = z_dim
         self.mtp_loss = MTPLoss(num_modes = 3, regression_loss_weight = 1., angle_threshold_degrees = 5.)
+        self.local_frame = local_frame
     
     def forward(self, graph, feats,e_w,snorm_n,snorm_e):
         pred = self.model(graph, feats,e_w,snorm_n,snorm_e)   #inference
@@ -148,18 +153,19 @@ class LitGNN(pl.LightningModule):
       
     def vae_loss(self, preds, mode_probs, gt, mask, KL_terms, z_sample):
 
-        if preds.shape[0] == NUM_MODES:
-            '''
+        if mode_probs.shape[0] == NUM_MODES:
+            preds = preds.view(NUM_MODES, gt.shape[0], -1, 2)
             losses = torch.Tensor().requires_grad_(True).to(preds.device)
-            #errors = torch.empty((NUM_MODES, gt.shape[0], gt.shape[1]), device=preds[0].device)
+            errors = torch.empty((NUM_MODES, gt.shape[0], gt.shape[-2]), device=preds[0].device)
 
             #overall_sum_time, overall_num, error = self.huber_loss(preds[0], gt[:,:,:2], mask, self.delta) #BV, T
             #errors = error.unsqueeze(0)
             #losses = torch.sum(errors,dim=-1)
-            for i, pred in enumerate(preds):
+            for pred in preds:
                 overall_sum_time, overall_num, error = self.huber_loss(pred, gt[:,:,:2], mask, self.delta)  #BV, T
                 losses = torch.cat((losses, torch.sum(error,dim=-1).unsqueeze(0)), 0) #losses shape (NUM_MODES, BV)
-                #errors = tcionrch.cat((errors, error.unsqueeze(0)), 0)
+                errors = torch.cat((errors, error.unsqueeze(0)), 0)
+
             with torch.no_grad():
                 best_mode = torch.argmin(losses, dim=0)
 
@@ -168,10 +174,11 @@ class LitGNN(pl.LightningModule):
             # classification_loss = F.cross_entropy(mode_probs.transpose(1,0), best_mode)
 
             #recons_loss = regression_loss + self.classification_loss_weight * classification_loss
-            '''
-            recons_loss = self.mtp_loss(torch.cat((preds.view(NUM_MODES, gt.shape[0], output_dim-1), mode_probs.unsqueeze(2)),2), gt, None, mask)
+            
+            #avg, recons_loss, class_loss = self.mtp_loss(torch.cat((preds.view(NUM_MODES, gt.shape[0], output_dim-1), mode_probs.unsqueeze(2)),2), gt, None, mask)
 
         else:
+            preds = preds.view(gt.shape[0], -1, 2)
             overall_sum_time, overall_num,_ = self.huber_loss(preds[:,:,:2], gt[:,:,:2], mask, self.delta)  #T
             recons_loss = torch.sum(overall_sum_time/overall_num.sum(dim=-2)) #T -> 1
         
@@ -200,7 +207,7 @@ class LitGNN(pl.LightningModule):
                 Normal(KL_terms[0], std), Normal(KL_terms[2], std_prior)
             ).sum(-1)
 
-            loss = recons_loss + self.beta * kld_loss.mean() + self.beta * kld_prior.mean() #+ self.gamma * z0_loss
+            loss = recons_loss #+ self.beta * kld_loss.mean() + self.beta * kld_prior.mean() #+ self.gamma * z0_loss
             return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss,  'KL': kld_loss.mean(), 'KL_prior':  kld_prior.mean(),  'beta': self.beta} #'z0': self.gamma *z0_loss,}
         else:
             loss = recons_loss + self.beta * kld_loss.mean() #+ self.gamma * z0_loss
@@ -209,17 +216,21 @@ class LitGNN(pl.LightningModule):
     
     def training_step(self, train_batch, batch_idx):
         '''returns a loss from a single batch'''
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene_id = train_batch
-        _, labels_vel = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels, maps, scene_id = train_batch
+
+        if not self.local_frame:
+            _, labels = compute_change_pos(feats,labels[:,:,:2], self.scale_factor)
+        
         ###feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         #labels = torch.cat([labels_vel, labels_pos[:,:,2:]], dim=-1)
         e_w = batched_graph.edata['w'].float()
         if not self.rel_types:
             e_w= e_w.unsqueeze(1)
-         
-        preds, mode_probs, KL_terms, z = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
         
-        total_loss, logs = self.vae_loss(preds.view(NUM_MODES, feats.shape[0], -1, 2), mode_probs, labels_vel.unsqueeze(1), output_masks, KL_terms, z)
+        
+        preds, mode_probs, KL_terms, z = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels, maps)
+        
+        total_loss, logs = self.vae_loss(preds, mode_probs, labels, output_masks, KL_terms, z)
 
         self.log_dict({f"Sweep/train_{k}": v for k,v in logs.items()}, on_step=False, on_epoch=True)
         return total_loss
@@ -229,31 +240,33 @@ class LitGNN(pl.LightningModule):
 
         
     def validation_step(self, val_batch, batch_idx):
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene_id = val_batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels, maps, scene_id = val_batch
 
         last_loc = feats[:,-1:,:2].detach().clone() * 5
-        feats_vel, labels_vel = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
-        ##feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
+        if not self.local_frame:
+            feats_vel, labels = compute_change_pos(feats,labels[:,:,:2], self.scale_factor)
+            ##feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
         e_w = batched_graph.edata['w']
         if not self.rel_types:
             e_w= e_w.unsqueeze(1)
         
-        preds, mode_probs, KL_terms, z_sample = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels_vel, maps)
+        preds, mode_probs, KL_terms, z_sample = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels, maps)
            
         best_mode = torch.argmax(mode_probs, dim=0)
         # Keep the best mode for each agent
         pred = preds[best_mode, torch.arange(feats.shape[0])].view(feats.shape[0], -1, 2)
 
         #total_loss, logs = self.vae_loss(pred, prob, labels_vel, output_masks, mu, log_var)
-        overall_sum_time, overall_num, _ = self.huber_loss(pred, labels_vel[:,:,:2], output_masks, self.delta)  #T
+        overall_sum_time, overall_num, _ = self.huber_loss(pred, labels[:,:,:2], output_masks, self.delta)  #T
         huber_loss = torch.sum(overall_sum_time/overall_num.sum(dim=-2)) / self.future_frames
 
-        for i in range(1,labels_pos.shape[-2]):
-            pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
-        pred = pred + last_loc
+        if not self.local_frame:
+            for i in range(1,labels.shape[-2]):
+                pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
+            pred = pred + last_loc
 
-        _, overall_num, x2y2error = self.compute_MSE(pred, labels_pos[:,:,:2], output_masks)  #T, (BV,T)
+        _, overall_num, x2y2error = self.compute_MSE(pred, labels[:,:,:2], output_masks)  #T, (BV,T)
         rmse_loss = torch.sum(((x2y2error**0.5).sum(dim=0))/overall_num.sum(dim=0)) / self.future_frames
     
         #self.log_dict({f"Sweep/val_{k}": v for k,v in logs.items()})
@@ -269,7 +282,7 @@ class LitGNN(pl.LightningModule):
             plot_grad_flow(self.model.named_parameters)
          
     def test_step(self, test_batch, batch_idx):
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, _,_,_, maps  = test_batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels, _,_,_, maps  = test_batch
         last_loc = feats[:,-1:,:2].detach().clone() 
         rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
         ##feats_vel, labels = compute_change_pos(feats,labels_pos[:,:,:2], self.scale_factor)
@@ -292,12 +305,14 @@ class LitGNN(pl.LightningModule):
             preds, _, _ = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e, maps) 
             prob = preds[:,-1]
             preds=preds.view(preds[:,:-1].shape[0],self.future_frames,-1)[:,:,:2]
+           
             #Convert prediction to absolute positions
-            for j in range(1,labels_pos.shape[1]):
-                preds[:,j,:] = torch.sum(preds[:,j-1:j+1,:],dim=-2) #6,2 
-            preds = preds + last_loc
+            if not self.local_frame:
+                for j in range(1,labels.shape[1]):
+                    preds[:,j,:] = torch.sum(preds[:,j-1:j+1,:],dim=-2) #6,2 
+                preds = preds + last_loc
             #Compute error for this sample
-            _ , overall_num, x2y2_error = self.compute_MSE(preds, labels_pos[:,:,:2], output_masks)
+            _ , overall_num, x2y2_error = self.compute_MSE(preds, labels[:,:,:2], output_masks)
             ade_ts = torch.sum((x2y2_error**0.5), dim=0) / torch.sum(overall_num, dim=0)   
             ade_s = torch.sum(ade_ts)/ self.future_frames  #T ->1
             fde_s = torch.sum((x2y2_error**0.5), dim=0)[-1] / torch.sum(overall_num, dim=0)[-1]
@@ -349,7 +364,7 @@ def main(args: Namespace):
     train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, rel_types = args.ew_dims>1, scale_factor = args.scale_factor, wandb = not args.nowandb,
     decay_rate = args.decay_rate, reconstruction_loss = args.reconstruction_loss, gamma = args.gamma, batch_size = args.batch_size, beta_period = args.beta_period, 
     beta_ratio_annealing = args.beta_ratio_annealing, beta_max_value = args.beta_max_value, model_type = args.model_type, classification_loss_weight = args.classification_loss_weight,
-    z_dim=args.z_dims)
+    z_dim=args.z_dims, local_frame=args.local_frame)
     
     
     early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=10)
@@ -372,7 +387,7 @@ def main(args: Namespace):
     if args.ckpt is not None:
         LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
                     train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
-                    model_type=args.model_type)
+                    model_type=args.model_type, local_frame=args.local_frame)
 
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler=True)
@@ -422,6 +437,8 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument("--decay_rate", type=float, default=1., help='wether to apply lr_scheduling. If != 0 apply ReduceLROnPlateau')
     parser.add_argument('--classification_loss_weight', type=float, default=1., help="Weight for Cross Entropy loss.")
+
+    parser.add_argument('--local_frame',  type=str2bool, nargs='?', const=True, default=False, help='whether to use local or global features.')  
     
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')  
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path for only testing.')   
