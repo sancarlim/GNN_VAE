@@ -184,8 +184,6 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         #For visualization
         self.global_features = self.all_feature[:,:,:self.history_frames,feature_id]
 
-            
-
         
     def __len__(self):
             return len(self.all_feature)
@@ -217,10 +215,24 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         feats[-1,:,-1] = 1
         self.output_mask[idx, self.num_visible_object[idx]-1, self.history_frames:] = 1
 
+
         sample_token=str(self.all_tokens[idx][0,1])
         with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
+
+        # Check all feats = 0
+        if self.local_frame:
+            empty_agents= []
+            for i,feat_i in enumerate(feats):
+                if not feat_i.any():
+                    empty_agents.append(i)
+            idx_with_data = list(set(range(len(feats))) - set(empty_agents))
+            feats = feats[idx_with_data] 
+            gt = gt[idx_with_data]
+            output_mask = output_mask[idx_with_data]       
+            maps = maps[idx_with_data]
+            graph.remove_nodes(empty_agents)
         
         #img=((maps-maps.min())*255/(maps.max()-maps.min())).numpy()
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img[0].transpose(1,2,0), cv2.COLOR_RGB2BGR))
@@ -234,10 +246,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False, local_frame=True)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
-    test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_test) )
-    for batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens, scene_ids, mean_xy, maps in test_dataloader:
+    test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch) )
+    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_ids  in test_dataloader:
         print(feats.shape, maps.shape, scene_ids)
     

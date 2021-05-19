@@ -236,10 +236,10 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_dec(h_dec)
             
-        h = self.GNN_decoder(g,h_dec,e_w,snorm_n)
-        h = torch.cat([h, z_sample],dim=-1)
+        h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
+        h_dec = torch.cat([h_dec, z_sample],dim=-1)
 
-        return self.MLP_decoder(h) 
+        return self.MLP_decoder(h_dec) 
 
     
     def inference(self, g, feats, e_w, snorm_n,snorm_e, maps):
@@ -283,15 +283,22 @@ class VAE_GNN_prior(nn.Module):
         mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
         #### DECODE ####      
-        pred = torch.Tensor().requires_grad_(True).to(feats.device)
-        std = torch.exp(0.5 * log_var_prior)
+        '''
+        pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
 
         for i in range(NUM_MODES):
             #### Sample from the latent distribution ###
             z_sample = self.reparameterize(mu_prior, log_var_prior)
-            pred = torch.cat( [pred, self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample).unsqueeze(0)],  dim = 0) # 3, N, 25
-
+            pred.append( self.decode(g, h_emb, e_w, snorm_n, maps_emb, torch.clamp(z_sample, max=500)) )#torch.cat( ,  dim = 0) # 3, N, 25
+        
+        pred = torch.stack(pred,dim=0)
         return pred[:,:,:-1], pred[:,:,-1], torch.stack((mu, log_var, mu_prior, log_var_prior), 1), z_sample
+        '''
+        z_sample = self.reparameterize(mu_prior, log_var_prior)
+        pred = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
+
+        return pred[:,:-1], pred[:,-1], [mu, log_var, mu_prior, log_var_prior], z_sample
+
 
 if __name__ == '__main__':
     history_frames = 5
@@ -299,12 +306,12 @@ if __name__ == '__main__':
     hidden_dims = 128
     heads = 1
 
-    input_dim = 6*history_frames
+    input_dim = 7*(history_frames-1)
     output_dim = 2*future_frames + 1
 
     model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet18')
     #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
 

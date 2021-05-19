@@ -109,7 +109,7 @@ class LitGNN(pl.LightningModule):
             return {
                 'optimizer': opt,
                 'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt, threshold=0.001, patience=3, verbose=True),
-                'monitor': "Sweep/val_rmse_loss"
+                'monitor': "Sweep/val_Reconstruction_Loss" #val_rmse_loss"
             }
 
         return opt
@@ -150,7 +150,6 @@ class LitGNN(pl.LightningModule):
         else:
             self.beta += step
 
-      
     def vae_loss(self, preds, mode_probs, gt, mask, KL_terms, z_sample):
 
         if mode_probs.shape[0] == NUM_MODES:
@@ -181,7 +180,7 @@ class LitGNN(pl.LightningModule):
             preds = preds.view(gt.shape[0], -1, 2)
             overall_sum_time, overall_num,_ = self.huber_loss(preds[:,:,:2], gt[:,:,:2], mask, self.delta)  #T
             recons_loss = torch.sum(overall_sum_time/overall_num.sum(dim=-2)) #T -> 1
-        
+
         #kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
         std = torch.exp(KL_terms[1] / 2)
         kld_loss = kl_divergence(
@@ -207,7 +206,7 @@ class LitGNN(pl.LightningModule):
                 Normal(KL_terms[0], std), Normal(KL_terms[2], std_prior)
             ).sum(-1)
 
-            loss = recons_loss #+ self.beta * kld_loss.mean() + self.beta * kld_prior.mean() #+ self.gamma * z0_loss
+            loss = recons_loss + self.beta * kld_loss.mean() + self.beta * kld_prior.mean() #+ self.gamma * z0_loss
             return loss, {'loss': loss, 'Reconstruction_Loss':recons_loss,  'KL': kld_loss.mean(), 'KL_prior':  kld_prior.mean(),  'beta': self.beta} #'z0': self.gamma *z0_loss,}
         else:
             loss = recons_loss + self.beta * kld_loss.mean() #+ self.gamma * z0_loss
@@ -219,7 +218,8 @@ class LitGNN(pl.LightningModule):
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels, maps, scene_id = train_batch
 
         if not self.local_frame:
-            _, labels = compute_change_pos(feats,labels[:,:,:2], self.scale_factor)
+            feats_vel, labels = compute_change_pos(feats,labels[:,:,:2], self.scale_factor)
+            feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
         ###feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         #labels = torch.cat([labels_vel, labels_pos[:,:,2:]], dim=-1)
@@ -245,14 +245,15 @@ class LitGNN(pl.LightningModule):
         last_loc = feats[:,-1:,:2].detach().clone() * 5
         if not self.local_frame:
             feats_vel, labels = compute_change_pos(feats,labels[:,:,:2], self.scale_factor)
-            ##feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
+            feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
         e_w = batched_graph.edata['w']
         if not self.rel_types:
             e_w= e_w.unsqueeze(1)
         
         preds, mode_probs, KL_terms, z_sample = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, labels, maps)
-           
+
+        ''' 
         best_mode = torch.argmax(mode_probs, dim=0)
         # Keep the best mode for each agent
         pred = preds[best_mode, torch.arange(feats.shape[0])].view(feats.shape[0], -1, 2)
@@ -268,10 +269,12 @@ class LitGNN(pl.LightningModule):
 
         _, overall_num, x2y2error = self.compute_MSE(pred, labels[:,:,:2], output_masks)  #T, (BV,T)
         rmse_loss = torch.sum(((x2y2error**0.5).sum(dim=0))/overall_num.sum(dim=0)) / self.future_frames
-    
-        #self.log_dict({f"Sweep/val_{k}": v for k,v in logs.items()})
-        self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
-        return rmse_loss
+        '''
+        total_loss, logs = self.vae_loss(preds, mode_probs, labels, output_masks, KL_terms, z_sample)
+
+        self.log_dict({f"Sweep/val_{k}": v for k,v in logs.items()})
+        #self.log_dict({"Sweep/val_huber_loss": huber_loss, "Sweep/val_rmse_loss": rmse_loss})
+        return logs['Reconstruction_Loss'] 
 
     def validation_epoch_end(self, val_loss_over_batches):
         #log best val loss
@@ -333,9 +336,9 @@ class LitGNN(pl.LightningModule):
 def main(args: Namespace):
     seed=seed_everything(0)
 
-    train_dataset = nuscenes_Dataset(train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames) #3447
-    val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames)  #919
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True)  #230
+    train_dataset = nuscenes_Dataset(train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, local_frame = args.local_frame) #3447
+    #val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, local_frame = args.local_frame)  #919
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=False, local_frame = args.local_frame)  #230
 
     '''
     if args.ckpt is not None:
@@ -361,13 +364,13 @@ def main(args: Namespace):
     
     
     LitGNN_sys = LitGNN(model=model, lr1 = args.lr1, lr2 = args.lr2,  wd = args.wd, history_frames = history_frames, future_frames = future_frames, delta = args.delta,
-    train_dataset = train_dataset, val_dataset = val_dataset, test_dataset = test_dataset, rel_types = args.ew_dims>1, scale_factor = args.scale_factor, wandb = not args.nowandb,
+    train_dataset = train_dataset, val_dataset = test_dataset, test_dataset = test_dataset, rel_types = args.ew_dims>1, scale_factor = args.scale_factor, wandb = not args.nowandb,
     decay_rate = args.decay_rate, reconstruction_loss = args.reconstruction_loss, gamma = args.gamma, batch_size = args.batch_size, beta_period = args.beta_period, 
     beta_ratio_annealing = args.beta_ratio_annealing, beta_max_value = args.beta_max_value, model_type = args.model_type, classification_loss_weight = args.classification_loss_weight,
     z_dim=args.z_dims, local_frame=args.local_frame)
     
     
-    early_stop_callback = EarlyStopping('Sweep/val_rmse_loss', patience=10)
+    early_stop_callback = EarlyStopping('Sweep/val_Reconstruction_Loss', patience=10)
 
     if not args.nowandb:
         run=wandb.init(job_type="training", entity='sandracl72', project='nuscenes')  
@@ -386,7 +389,7 @@ def main(args: Namespace):
 
     if args.ckpt is not None:
         LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
-                    train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
+                    train_dataset=train_dataset, val_dataset=test_dataset, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, 
                     model_type=args.model_type, local_frame=args.local_frame)
 
         print('############ TEST  ##############')
@@ -418,7 +421,7 @@ if __name__ == '__main__':
                                         choices=['vae_gat', 'vae_gated', 'vae_prior'])
     parser.add_argument("--reconstruction_loss", type=str, default='huber', help="Choose reconstruction loss.",
                                         choices=['huber', 'mse'])
-    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
+    parser.add_argument("--backbone", type=str, default='resnet18', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'resnet50', 'resnet18', 'map_encoder'])
     parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN (bn) or GroupNorm (gn).")
     parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
@@ -438,7 +441,7 @@ if __name__ == '__main__':
     parser.add_argument("--decay_rate", type=float, default=1., help='wether to apply lr_scheduling. If != 0 apply ReduceLROnPlateau')
     parser.add_argument('--classification_loss_weight', type=float, default=1., help="Weight for Cross Entropy loss.")
 
-    parser.add_argument('--local_frame',  type=str2bool, nargs='?', const=True, default=False, help='whether to use local or global features.')  
+    parser.add_argument('--local_frame',  type=str2bool, nargs='?', const=True, default=True, help='whether to use local or global features.')  
     
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')  
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path for only testing.')   
