@@ -144,7 +144,7 @@ class LitGNN(pl.LightningModule):
         print(tokens_eval)
         
         rescale_xy=torch.ones((1,1,2), device=self.device)*self.scale_factor
-        last_loc = feats[:,-1:,:2].detach().clone() 
+        last_loc = feats[:,-1:,:2].detach().clone() * 5
         
         ##feats_vel, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
         ##feats_local = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
@@ -250,13 +250,15 @@ class LitGNN(pl.LightningModule):
             annotation = helper.get_sample_annotation(instance, sample_token)
             category = annotation['category_name'].split('.')
             attribute = nuscenes.get('attribute', annotation['attribute_tokens'][0])['name']
-            history = global_feats[idx,:,:2].cpu().numpy()
+            history = global_feats[idx,:self.history_frames,:2].cpu().numpy()
             
-            prediction = prediction_all_agents[:,idx]
 
             if self.model_type == 'mtp':
+                prediction = prediction_all_agents[idx, :]
                 prediction = torch.tensor([ convert_local_coords_to_global(prediction[i], annotation['translation'], annotation['rotation']) for i in range(prediction.shape[0])])
-
+            else:
+                prediction = prediction_all_agents[:,idx]
+                
             if self.scale_factor == 1:
                 pass#history = history*12.4354+0.1579
             else:
@@ -264,7 +266,7 @@ class LitGNN(pl.LightningModule):
             
             #remove zero rows (no data in those frames) and rescale to obtain global coords.
             history = (history[history.all(axis=1)] + mean_xy[0])
-            future = labels_pos[idx].cpu().numpy()
+            future = global_feats[idx, self.history_frames:, :2].cpu().numpy() #labels_pos[idx].cpu().numpy()
             future = future[future.all(axis=1)] + mean_xy[0]
             if history.shape[0] < 2:
                 if history.shape[0] == 0:
@@ -372,8 +374,8 @@ class LitGNN(pl.LightningModule):
             
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'visualizations_MTP_' , scene_name + '_' + str(self.cnt) + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
-        print('Image saved in: ', os.path.join(base_path, 'visualizations_MTP_' , scene_name + '_' + str(self.cnt) + '_' + sample_token + '.jpg'))
+        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + '_MTP_' + str(self.cnt) + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        print('Image saved in: ', os.path.join(base_path, 'visualizations' , scene_name + '_MTP_' + str(self.cnt) + '_' + sample_token + '.jpg'))
         plt.clf()
         self.cnt += 1
    
@@ -382,7 +384,7 @@ def main(args: Namespace):
 
     seed=seed_everything(0)
 
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True, )  #25 seq 2 scenes 103, 916
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, challenge_eval=True, local_frame=True)  #25 seq 2 scenes 103, 916
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
@@ -395,8 +397,7 @@ def main(args: Namespace):
                         attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'))
     else:
-        hidden_dims = round(args.hidden_dims // args.heads)
-        model = SCOUT(input_dim=input_dim_model, hidden_dim=hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
+        model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
     
 
@@ -405,8 +406,8 @@ def main(args: Namespace):
       
     trainer = pl.Trainer(gpus=1, deterministic=True,  profiler=True) 
  
-    #LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
-    #                train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
+    LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
+                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
 
     
     trainer.test(LitGNN_sys)
@@ -417,9 +418,9 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
-    parser.add_argument("--ew_dims", type=int, default=1, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
+    parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=256)
+    parser.add_argument("--hidden_dims", type=int, default=512)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'scout', 'mtp'])
     parser.add_argument("--dropout", type=float, default=0.1)

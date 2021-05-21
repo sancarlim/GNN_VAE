@@ -28,16 +28,15 @@ max_num_objects = 150
 total_feature_dimension = 16
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
 
+
 def collate_batch_test(samples):
-    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
+    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps, global_feats = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
     masks = torch.vstack(masks)
     feats = torch.vstack(feats)
+    global_feats = torch.vstack(global_feats)
     gt = torch.vstack(gt).float()
     if maps[0] is not None:
         maps = torch.vstack(maps)
-
-    if maps.shape[0] != feats.shape[0]:
-        print(scene_ids[0])
     sizes_n = [graph.number_of_nodes() for graph in graphs] # graph sizes
     snorm_n = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_n]
     snorm_n = torch.cat(snorm_n).sqrt()  # graph size normalization 
@@ -45,7 +44,7 @@ def collate_batch_test(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps, global_feats
 
 
 def collate_batch(samples):
@@ -168,11 +167,23 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if self.local_frame:
             all_feature = self.all_feature.clone()
             for seq in range(self.all_feature.shape[0]):
-                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) if mask_i.any() else 0 for mask_i in self.output_mask[seq,:self.num_visible_object[seq],:self.history_frames,:2].squeeze(dim=-1) ])
-                all_feature[seq,:self.num_visible_object[seq],:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq])])
+                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-1]])
+                all_feature[seq,:self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq]-1)])
+                # Convert ego feats
+                index = self.all_feature[seq, self.num_visible_object[seq]-1, :history_frames, 0].nonzero()[0][0]
+                all_feature[seq,self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,self.num_visible_object[seq]-1,index:history_frames,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,2], True)])
+                
                 all_feature[seq,:self.num_visible_object[seq],history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq])])
-
+            
             self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+            '''
+            self.node_features[:,:,:,1] = (self.node_features[:,:,:,1] + 0.6967) / 2.8636
+            self.node_features[:,:,:,0] = self.node_features[:,:,:,0] / 0.2077
+            self.node_features[:,:,:,2] = (self.node_features[:,:,:,2] - 0.0215) / 0.6085
+            self.node_features[:,:,:,3] = self.node_features[:,:,:,3] / 1.55
+            self.node_features[:,:,:,4] = self.node_features[:,:,:,4] / 1.335
+            self.node_features[:,:,:,5] = (self.node_features[:,:,:,5] - 0.0917) / 0.2886
+            '''
             self.node_labels = all_feature[:,:,self.history_frames:,:2] 
         else:
             ###### Normalize with training statistics to have 0 mean and std=1 #######
@@ -182,7 +193,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             #self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] - 0.014 ) / 0.51    # Normalize heading for z0 loss.
 
         #For visualization
-        self.global_features = self.all_feature[:,:,:self.history_frames,feature_id]
+        self.global_features = self.all_feature[:,:,:,feature_id]
 
         
     def __len__(self):
@@ -221,6 +232,9 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
 
+        tokens = self.all_tokens[idx]
+        global_feats = self.global_features[idx,:self.num_visible_object[idx],:,:3]
+
         # Check all feats = 0
         if self.local_frame:
             empty_agents= []
@@ -230,9 +244,11 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             idx_with_data = list(set(range(len(feats))) - set(empty_agents))
             feats = feats[idx_with_data] 
             gt = gt[idx_with_data]
-            output_mask = output_mask[idx_with_data]       
+            output_mask = output_mask[idx_with_data]   
+            global_feats = global_feats[idx_with_data]       
             maps = maps[idx_with_data]
             graph.remove_nodes(empty_agents)
+            tokens = tokens[idx_with_data]
         
         #img=((maps-maps.min())*255/(maps.max()-maps.min())).numpy()
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img[0].transpose(1,2,0), cv2.COLOR_RGB2BGR))
@@ -240,16 +256,16 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             print('stop')
         scene_id = int(self.scene_ids[idx])
         if self.challenge_eval:
-            return graph, output_mask, feats, gt, self.all_tokens[idx], scene_id, self.all_mean_xy[idx,:2], maps , self.global_features[idx,:self.num_visible_object[idx],:,:2]
+            return graph, output_mask, feats, gt, tokens, scene_id, self.all_mean_xy[idx,:2], maps , global_feats
             
         return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx])
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False, local_frame=True)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True, local_frame=True)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
-    test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch) )
-    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_ids  in test_dataloader:
-        print(feats.shape, maps.shape, scene_ids)
+    test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_test) )
+    for batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens, scene_id, mean_xy, maps, global_feats  in test_dataloader:
+        print(feats.shape, maps.shape, scene_id)
     
