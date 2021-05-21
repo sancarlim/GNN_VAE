@@ -31,17 +31,14 @@ class ResNet18(nn.Module):
 
 
 class ResNet50(nn.Module):
-    def __init__(self, hidden_dim, freeze=7):
+    def __init__(self, hidden_dim, freeze=6):
         super(ResNet50, self).__init__()
         
         model_ft = resnet50(pretrained=True)
-        self.base= nn.Sequential(*list(model_ft.children())[:6])
-        #moduels.append(torch.)
-        #modules.append(torch.nn.AdaptiveAvgPool2d((1, 1))) 
-        #modules.append(torch.nn.Flatten(start_dim=1))
+        self.base= nn.Sequential(*list(model_ft.children())[:6])  # (512,28,28)
         self.last_conv = torch.nn.Sequential(
-                            #nn.Conv2d(512, 256, kernel_size=3, stride=2, padding=1,bias=False),
-                            #nn.BatchNorm2d(256),
+                            #nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1, bias=False), # (256,15,15)
+                            #nn.BatchNorm2d(512),
                             #nn.ReLU(inplace=True),
                             nn.AdaptiveAvgPool2d((1, 1)),
                             nn.Flatten(),
@@ -117,8 +114,7 @@ class My_MapEncoder(nn.Module):
         x = F.leaky_relu(self.bn1(self.conv1(x)), 0.2)
         for conv in self.convs:
             x = conv(x)
-        
-        x = self.avgpool(x)
+        #x = self.avgpool(x)
         x = torch.flatten(x, start_dim=1)
         maps_enc = self.fc(x)
         return maps_enc

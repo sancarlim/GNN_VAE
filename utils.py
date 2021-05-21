@@ -176,6 +176,7 @@ class MTPLoss:
         batch_losses = torch.Tensor().requires_grad_(True).to(predictions.device)
         class_losses = torch.Tensor().to(predictions.device)
         regression_losses = torch.Tensor().to(predictions.device)
+        best_trajs = torch.Tensor().to(predictions.device)
         if len(predictions.shape) == 2:
             trajectories, modes = self._get_trajectory_and_modes(predictions)
         else:
@@ -200,6 +201,7 @@ class MTPLoss:
             #                                    trajectories=trajectories[batch_idx])
             
             if not mask[batch_idx].squeeze().any():
+                best_trajs = torch.cat((best_trajs, trajectories[batch_idx, 0, :].unsqueeze(0)), 0)
                 continue
 
             distances_from_ground_truth = []
@@ -225,12 +227,13 @@ class MTPLoss:
             batch_losses = torch.cat((batch_losses, loss.unsqueeze(0)), 0)
             class_losses = torch.cat((class_losses, classification_loss.unsqueeze(0)), 0)
             regression_losses = torch.cat((regression_losses, regression_loss.unsqueeze(0)), 0)
+            best_trajs = torch.cat((best_trajs, best_mode_trajectory), 0)
 
         avg_loss = torch.mean(batch_losses)
         regression_avg_loss = torch.mean(regression_losses)
         class_avg_loss = torch.mean(class_losses)
 
-        return avg_loss, regression_avg_loss, class_avg_loss
+        return avg_loss, regression_avg_loss, class_avg_loss, best_trajs
 
 
 
@@ -268,17 +271,16 @@ def check_overlap(preds):
 
 def compute_change_pos(feats,gt, scale_factor):
     gt_vel = gt.clone()  #.detach().clone()
-    feats_vel = feats[:,:,:2].clone() * 5
+    feats_vel = feats[:,:,:2].clone() 
     new_mask_feats = (feats_vel[:, 1:]!=0) * (feats_vel[:, :-1]!=0) 
     new_mask_gt = (gt_vel[:, 1:]!=0) * (gt_vel[:, :-1]!=0) 
 
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
-    if scale_factor==1:
-        gt_vel[:, :1] = (gt_vel[:, :1] - (feats_vel[:, -1:] )) * new_mask_gt[:,0:1]
-    else:
-        rescale_xy=torch.ones((1,1,2), device=feats.device)*scale_factor
-        gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]*rescale_xy) * new_mask_gt[:,0:1]
+    if scale_factor != 0:
+        # Global feats scaled by 5
+        feats_vel *= 5
+        gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]) 
 
     feats_vel[:, 1:] = (feats_vel[:, 1:] - feats_vel[:, :-1]) * new_mask_feats
     feats_vel[:, 0] = 0
@@ -381,8 +383,8 @@ def convert_local_coords_to_global(coordinates: np.ndarray,
         Representation - cos(theta / 2) + (xi + yi + zi)sin(theta / 2).
     :return: x,y locations stored in array of share [n_times, 2].
     """
-    yaw = angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
+    yaw = angle_of_rotation(rotation.cpu().numpy())#quaternion_yaw(Quaternion(rotation)))
 
     transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
 
-    return np.dot(transform, coordinates.cpu().numpy().T).T[:, :2] + np.atleast_2d(np.array(translation)[:2])
+    return np.dot(transform, coordinates.T).T[:, :2] + np.atleast_2d(np.array(translation.cpu().numpy())[:2])
