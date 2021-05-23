@@ -19,7 +19,6 @@ from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
 
-
 class GATConv(nn.Module):
     def __init__(self,
                  in_feats,
@@ -208,11 +207,11 @@ class MultiHeadGATLayer(nn.Module):
             return torch.mean(torch.stack(head_outs, dim=1),dim=1)
 
     
-class SCOUT(nn.Module):
+class SCOUT_MTP(nn.Module):
     
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, bn=False, gn=False, 
                 feat_drop=0., attn_drop=0., heads=1,att_ew=False, res_weight=True, 
-                res_connection=True, ew_dims=False,  backbone='mobilenet', freeze=0):
+                res_connection=True, ew_dims=False,  backbone='mobilenet', freeze=0, num_modes=3):
         super().__init__()
 
         self.heads = heads
@@ -222,6 +221,7 @@ class SCOUT(nn.Module):
         self.output_dim = output_dim
         self.ew_dims = ew_dims
         self.backbone = backbone
+        self.num_modes = num_modes
 
         #self.embedding_h = nn.Sequential(
         #                                nn.Linear(input_dim, hidden_dim//2),
@@ -290,14 +290,17 @@ class SCOUT(nn.Module):
         if heads == 1:
             self.gat_1 = My_GATLayer(self.hidden_dim, self.hidden_dim, e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection) #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu) 
             self.gat_2 = My_GATLayer(self.hidden_dim, self.hidden_dim,  e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection)  #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu)
-            self.linear1 = nn.Linear(self.hidden_dim, output_dim )
+            self.linear1 = nn.Linear(self.hidden_dim, output_dim * self.num_modes)
         else:
             self.gat_1 = MultiHeadGATLayer(self.hidden_dim, self.hidden_dim, e_dims=self.hidden_dim//2*2,res_weight=res_weight, merge='cat', res_connection=res_connection , num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) #GATConv(hidden_dim, hidden_dim, heads,feat_drop, attn_drop,residual=True, activation='relu')
             #self.embedding_e2 = nn.Linear(2, hidden_dims*heads) if ew_type else nn.Linear(1, hidden_dims*heads)
-            self.gat_2 = MultiHeadGATLayer(self.hidden_dim*heads, self.hidden_dim*heads,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='avg', res_connection=res_connection ,num_heads=heads, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
+            self.gat_2 = MultiHeadGATLayer(self.hidden_dim*heads, self.hidden_dim*heads,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='cat', res_connection=res_connection ,num_heads=self.num_modes, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
             
-            self.linear1 = nn.Linear(self.hidden_dim * heads, output_dim) #nn.ModuleList()
-            
+            self.linear1 = nn.Linear(self.hidden_dim * heads * self.num_modes, output_dim * self.num_modes) #nn.ModuleList()
+            '''
+            for i in range(NUM_MODES):
+                self.linear1.append( nn.Linear(self.hidden_dim, output_dim) )
+            '''
             
         
         if dropout:
@@ -350,7 +353,6 @@ class SCOUT(nn.Module):
 
         if self.backbone != 'None':
             # Maps feature extraction
-            ##self.feature_extractor.eval()
             maps_embedding = self.feature_extractor(maps)   
             # Embeddings concatenation
             h = torch.cat([maps_embedding.squeeze(dim=-1).squeeze(dim=-1), h], dim=-1)
@@ -384,10 +386,19 @@ class SCOUT(nn.Module):
         h_modes=self.dropout_l(h_modes)
 
         y = self.linear1(h_modes)
+        
+        
+        mode_probabilities = torch.cat([y[:, self.output_dim * i - 1].unsqueeze(1) for i in range(1,self.num_modes+1)], dim=1)
+        predictions = torch.cat([y[:, self.output_dim * (i-1) : self.output_dim*i - 1]  for i in  range(1,self.num_modes+1)], dim=1)
 
-        h=self.dropout_l(h_modes)
-        y = self.linear1(h)
-        return y  #return trajectory / final position + probability
+        # Normalize the probabilities to sum to 1 for inference.
+        ##mode_probabilities = y[:, -self.num_modes:].clone()
+        ##predictions = y[:, :-self.num_modes]
+
+        if not self.training:
+            mode_probabilities = F.softmax(mode_probabilities, dim=-1)
+
+        return torch.cat((predictions, mode_probabilities), 1)
         
 
 if __name__ == '__main__':

@@ -1,7 +1,6 @@
 
 import sys
 sys.path.append('../../DBU_Graph')
-from NuScenes.main_GNN_VAE_nuscenes import NUM_MODES
 import dgl
 import torch
 from torch.utils.data import DataLoader
@@ -12,6 +11,7 @@ from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_test
 from models.VAE_GNN import VAE_GNN
 from models.VAE_GATED import VAE_GATED
 from models.scout import SCOUT
+from models.scout_MTP import SCOUT_MTP
 from models.VAE_PRIOR import VAE_GNN_prior
 import wandb
 import pytorch_lightning as pl
@@ -33,7 +33,7 @@ total_frames = history_frames + future_frames #2s of history + 6s of prediction
 input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 + 1
 base_path = '/home/sandra/PROGRAMAS/DBU_Graph/NuScenes'
-
+NUM_MODES = 6
 
 
 class LitGNN(pl.LightningModule):
@@ -92,19 +92,22 @@ class LitGNN(pl.LightningModule):
 
             for i in range(1,labels_pos.shape[1]):
                 preds[:,i,:] = torch.sum(preds[:,i-1:i+1,:],dim=-2) #BV,6,2 
-            preds += last_loc
+            #preds += last_loc
 
             # Provide predictions in global-coordinates
-            pred_x = preds[:,:,0].cpu().numpy() + mean_xy[0][0]  # [N_agents, T]
-            pred_y = preds[:,:,1].cpu().numpy() + mean_xy[0][1]
+            ##pred_x = preds[:,:,0].cpu().numpy() + mean_xy[0][0]  # [N_agents, T]
+            ##pred_y = preds[:,:,1].cpu().numpy() + mean_xy[0][1]
             
-            prediction_all_agents = np.expand_dims(np.stack([pred_x, pred_y],axis=-1), axis=0)
+            ##prediction_all_agents = np.expand_dims(np.stack([pred_x, pred_y],axis=-1), axis=0)
 
             for token in tokens_eval:
                 if str(token[0]+'_'+token[1]) in self.prediction_scenes['scene-'+ str(scene_id).zfill(4)]:
                     idx = np.where(np.array(tokens_eval)== token[0])[0][0]
                     instance, sample = token
-                    pred = Prediction(str(instance), str(sample), prediction_all_agents[:,idx], np.ones(1))  #need the pred to have 2d
+                    pred = preds[idx].cpu().numpy()
+                    prediction =  convert_local_coords_to_global(pred, global_feats[idx,history_frames-1,:2], global_feats[idx,history_frames-1,2]) + mean_xy
+                    
+                    pred = Prediction(str(instance), str(sample), np.expand_dims(prediction,0), np.ones(1))  #need the pred to have 2d
                     self.challenge_predictions.append(pred.serialize())
 
         elif self.model_type == 'mtp':
@@ -130,7 +133,7 @@ class LitGNN(pl.LightningModule):
                     for i, pred in enumerate(prediction):
                         prediction[i] =  convert_local_coords_to_global(pred, global_feats[idx,history_frames-1,:2], global_feats[idx,history_frames-1,2]) + mean_xy
                     labels = global_feats[idx,history_frames:,:2].cpu().numpy() + mean_xy
-                    preds = Prediction(str(instance), str(sample), prediction, np.ones(3)*1/3)  #need the pred to have 2d
+                    preds = Prediction(str(instance), str(sample), prediction, np.ones(NUM_MODES)*1/NUM_MODES)  #need the pred to have 2d
                     self.challenge_predictions.append(preds.serialize())
 
         else:
@@ -167,7 +170,7 @@ class LitGNN(pl.LightningModule):
                         self.challenge_predictions.append(pred.serialize())
             
     def test_epoch_end(self, outputs):
-        json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference.json'),'w'))
+        json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference_graceful.json'),'w'))
 
    
 def main(args: Namespace):
@@ -188,6 +191,9 @@ def main(args: Namespace):
         model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, 
                         ew_dims=args.ew_dims, backbone=args.backbone)
+    elif args.model_type == 'mtp':
+        model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
+                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
     else:
         model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone, freeze=args.freeze)
@@ -212,7 +218,7 @@ if __name__ == '__main__':
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
     parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=512)
+    parser.add_argument("--hidden_dims", type=int, default=2048)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'vae_prior','scout', 'mtp'])
     parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
@@ -224,7 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')
-    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
+    parser.add_argument("--backbone", type=str, default='resnet18', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'mobilenet', 'resnet18', 'resnet50', 'map_encoder'])
     
     
