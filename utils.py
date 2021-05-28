@@ -269,7 +269,7 @@ def check_overlap(preds):
         return torch.count_nonzero(intersect)/len(intersect) #percentage of intersections between all combinations
         #y_intersect=[np.argwhere(np.diff(np.sign(preds[i,:,1].cpu()-preds[j,:,1].cpu()))).size > 0 for j in range(i+1,len(preds)) for i in range(len(preds)-1)]
 
-def compute_change_pos(feats,gt, scale_factor):
+def compute_change_pos(feats,gt, local_frame):
     gt_vel = gt.clone()  #.detach().clone()
     feats_vel = feats[:,:,:2].clone() 
     new_mask_feats = (feats_vel[:, 1:]!=0) * (feats_vel[:, :-1]!=0) 
@@ -277,7 +277,7 @@ def compute_change_pos(feats,gt, scale_factor):
 
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
-    if scale_factor != 0:
+    if not local_frame:
         # Global feats scaled by 5
         feats_vel *= 5
         gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]) 
@@ -383,8 +383,8 @@ def convert_local_coords_to_global(coordinates: np.ndarray,
         Representation - cos(theta / 2) + (xi + yi + zi)sin(theta / 2).
     :return: x,y locations stored in array of share [n_times, 2].
     """
-    yaw = angle_of_rotation(rotation.cpu().numpy())#quaternion_yaw(Quaternion(rotation)))
+    yaw = angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
 
     transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
 
-    return np.dot(transform, coordinates.T).T[:, :2] + np.atleast_2d(np.array(translation.cpu().numpy())[:2])
+    return np.dot(transform, coordinates.T).T[:, :2] + np.atleast_2d(np.array(translation)[:2])

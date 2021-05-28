@@ -22,6 +22,8 @@ from nuscenes.eval.prediction.data_classes import Prediction
 import json
 from torchvision import transforms, utils
 from utils import convert_local_coords_to_global
+from nuscenes import NuScenes
+from nuscenes.prediction import PredictHelper
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
@@ -33,8 +35,12 @@ total_frames = history_frames + future_frames #2s of history + 6s of prediction
 input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 + 1
 base_path = '/home/sandra/PROGRAMAS/DBU_Graph/NuScenes'
-NUM_MODES = 6
+NUM_MODES = 8
 
+DATAROOT = '/media/14TBDISK/nuscenes'
+nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
+
+helper = PredictHelper(nuscenes)
 
 class LitGNN(pl.LightningModule):
     def __init__(self, model,  train_dataset, val_dataset, test_dataset, model_type, history_frames: int=3, future_frames: int=3, 
@@ -114,7 +120,7 @@ class LitGNN(pl.LightningModule):
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
             ##pred=pred.view(feats.shape[0],self.future_frames,-1)
             
-            mode_prob = pred[:, -NUM_MODES:].clone()
+            mode_probs = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             prediction_all_agents = pred[:, :-NUM_MODES].cpu().numpy().reshape(desired_shape)
             
@@ -129,11 +135,12 @@ class LitGNN(pl.LightningModule):
                         print('stop')
                     idx = np.where(np.array(tokens_eval)== token[0])[0][0]
                     instance, sample = token
+                    annotation = helper.get_sample_annotation(instance, sample)
                     prediction = prediction_all_agents[idx, :]
                     for i, pred in enumerate(prediction):
-                        prediction[i] =  convert_local_coords_to_global(pred, global_feats[idx,history_frames-1,:2], global_feats[idx,history_frames-1,2]) + mean_xy
-                    labels = global_feats[idx,history_frames:,:2].cpu().numpy() + mean_xy
-                    preds = Prediction(str(instance), str(sample), prediction, np.ones(NUM_MODES)*1/NUM_MODES)  #need the pred to have 2d
+                        prediction[i] =  convert_local_coords_to_global(pred,  annotation['translation'], annotation['rotation'])
+                    #labels = global_feats[idx,history_frames:,:2].cpu().numpy() + mean_xy
+                    preds = Prediction(str(instance), str(sample), prediction, mode_probs[idx].cpu().numpy())  #need the pred to have 2d
                     self.challenge_predictions.append(preds.serialize())
 
         else:
@@ -170,13 +177,11 @@ class LitGNN(pl.LightningModule):
                         self.challenge_predictions.append(pred.serialize())
             
     def test_epoch_end(self, outputs):
-        json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference_graceful.json'),'w'))
+        json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference_balmy.json'),'w'))
 
    
 def main(args: Namespace):
     print(args)
-
-    seed=seed_everything(0)
 
     test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, 
                         future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
@@ -193,7 +198,8 @@ def main(args: Namespace):
                         ew_dims=args.ew_dims, backbone=args.backbone)
     elif args.model_type == 'mtp':
         model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
+                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone,
+                        num_modes = NUM_MODES)
     else:
         model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone, freeze=args.freeze)
@@ -230,7 +236,7 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')
-    parser.add_argument("--backbone", type=str, default='resnet18', help="Choose CNN backbone.",
+    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'mobilenet', 'resnet18', 'resnet50', 'map_encoder'])
     
     

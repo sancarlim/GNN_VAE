@@ -88,7 +88,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if train_val_test == 'train':
             self.raw_dir =os.path.join(base_path, 'ns_step1_train.pkl' )#train_val_test = 'train_filter'
         else:
-            self.raw_dir = os.path.join(base_path,'ns_step1_test.pkl')
+            self.raw_dir = os.path.join(base_path,'ns_challenge_json_test.pkl')
+            self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
         
         #self.raw_dir = os.path.join(base_path,'nuscenes_' + train_val_test + '.pkl')
         self.challenge_eval = challenge_eval
@@ -155,8 +156,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         self.all_scenes = np.unique(self.scene_ids)
         self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
         self.output_mask= self.all_feature[:,:,:,-2].unsqueeze_(-1)
-        
-        
+        '''
+        for t in range(history_frames):
+            self.all_feature[:,:,t, 2] -=  self.all_feature[:,:,now_history_frame, 2] 
+        '''
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  
         #rescale_xy[:,:,:,1] = torch.max(abs(self.all_feature[:,:,:,1]))  
         #rescale_xy=torch.ones((1,1,1,2))*10
