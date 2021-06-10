@@ -75,14 +75,14 @@ class GAT_VAE(nn.Module):
         if heads == 1:
             self.gat_1 = My_GATLayer(hidden_dim, hidden_dim, feat_drop, attn_drop,att_ew) 
             if layers>1:
-                self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, 0., 0.,att_ew ) 
+                self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, feat_drop, attn_drop,att_ew ) 
         else:
-            self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim,  e_dims=hidden_dim//2*2 , res_weight=True, res_connection=True, merge='cat', num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew)            
+            self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim,  e_dims=hidden_dim//2*2 , res_weight=True, res_connection=True, merge='avg', num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew)            
             if layers>1:    
                 if ew_dims > 1:
                     #self.embedding_e2 = nn.Linear(ew_dims, hidden_dim*heads)
-                    self.resize_e2 = nn.ReplicationPad1d(hidden_dim*heads//2-1)
-                self.gat_2 = MultiHeadGATLayer(hidden_dim*heads,hidden_dim*heads, e_dims=hidden_dim*heads//2*2, res_weight=True, merge='cat', res_connection=True ,num_heads=1, feat_drop=0., attn_drop=0., att_ew=att_ew)    
+                    self.resize_e2 = nn.ReplicationPad1d(hidden_dim//2-1)
+                self.gat_2 = MultiHeadGATLayer(hidden_dim,hidden_dim, e_dims=hidden_dim//2*2, res_weight=True, merge='cat', res_connection=True ,num_heads=1, feat_drop=0., attn_drop=0., att_ew=att_ew)    
 
         #self.reset_parameters()
 
@@ -128,10 +128,10 @@ class VAE_GNN(nn.Module):
             self.feature_extractor = My_MapEncoder(input_channels = 1, input_size=112, 
                                                     hidden_channels = [16,32,32,40], output_size = hidden_dim, 
                                                     kernels = [5,5,3,3], strides = [1,2,2,2])
-            enc_dims = hidden_dim*2+output_dim    
+            enc_dims = hidden_dim*2+(output_dim-1)    
             dec_dims = z_dim + hidden_dim*2
         
-        elif backbone == 'resnet':       
+        elif backbone == 'resnet18':       
             model_ft = resnet18(pretrained=True)
             modules = list(model_ft.children())[:-3]
             modules.append(torch.nn.AdaptiveAvgPool2d((1, 1)))
@@ -145,8 +145,8 @@ class VAE_GNN(nn.Module):
                     for param in child.parameters():
                         param.requires_grad = False
             
-            enc_dims = 2*hidden_dim + output_dim #
-            dec_dims = 2*hidden_dim + z_dim #
+            enc_dims = 2*hidden_dim + (output_dim-1) 
+            dec_dims = 2*hidden_dim + z_dim 
         
         elif backbone == 'resnet_gray':
             resnet = resnet18(pretrained=False)
@@ -155,11 +155,10 @@ class VAE_GNN(nn.Module):
             modules[0] = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3,bias=False)  #stride=1 if list[:-1]
             nn.init.kaiming_normal_(modules[0].weight, mode='fan_out', nonlinearity='relu')
             self.feature_extractor=torch.nn.Sequential(*modules)   
-            enc_dims = hidden_dim + output_dim + 256
+            enc_dims = hidden_dim + (output_dim-1) + 256
             dec_dims = z_dim + hidden_dim + 256
 
             
-
         ############################
         # Input Features Embedding #
         ############################
@@ -175,7 +174,7 @@ class VAE_GNN(nn.Module):
         #############
         self.GNN_enc = GAT_VAE(enc_dims,layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
         encoder_dims = enc_dims*heads
-        self.MLP_encoder = MLP_Enc(encoder_dims+output_dim, z_dim, dropout=dropout)
+        self.MLP_encoder = MLP_Enc(encoder_dims+(output_dim-1), z_dim, dropout=dropout)
 
         #############
         #  DECODER  #
@@ -236,7 +235,7 @@ class VAE_GNN(nn.Module):
         return z_sample
 
     
-    def encode(self, g, h_emb, e_w, maps_emb, gt):
+    def encode(self, g, h_emb, e_w, snorm_n, maps_emb, gt):
         # Embeddings concatenation
         h = torch.cat([maps_emb.flatten(start_dim=1), h_emb, gt], dim=-1)
         #h = self.linear_cat(h)
@@ -253,7 +252,7 @@ class VAE_GNN(nn.Module):
         return z_sample, mu, log_var
 
     
-    def decode(self, g, h_emb, e_w, maps_emb, z_sample):    
+    def decode(self, g, h_emb, e_w, snorm_n, maps_emb, z_sample):    
         h_dec = torch.cat([maps_emb.flatten(start_dim=1), h_emb, z_sample],dim=-1)
         
         if self.bn:
@@ -303,12 +302,12 @@ class VAE_GNN(nn.Module):
         h_emb = self.embedding_h(feats) 
 
         #### ENCODER ####
-        z_sample, mu, log_var = self.encode(g, h_emb, e_w, maps_emb, gt)
+        z_sample, mu, log_var = self.encode(g, h_emb, e_w, snorm_n, maps_emb, gt)
         
         #### DECODE #### 
-        recon_y = self.decode(g, h_emb, e_w, maps_emb, z_sample)
+        recon_y = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
 
-        return recon_y,  torch.stack((mu, log_var), 1), z_sample
+        return recon_y[:,:-1], recon_y[:,-1],  [mu, log_var], z_sample
 
 if __name__ == '__main__':
     history_frames = 5

@@ -1,5 +1,6 @@
 
 import dgl
+from pytorch_lightning.core.hooks import CheckpointHooks
 from scipy.ndimage.measurements import label
 import torch
 from torch.utils.data import DataLoader
@@ -32,14 +33,13 @@ import matplotlib.patheffects as pe
 from nuscenes.prediction import PredictHelper
 from pyquaternion import Quaternion
 from nuscenes.eval.common.utils import quaternion_yaw, angle_diff
-from utils import convert_local_coords_to_global
+from utils_2 import convert_local_coords_to_global
 
 from scipy.ndimage import rotate
 
 FREQUENCY = 2
-dt = 1 / FREQUENCY
-history = 2
-future = 6
+history = 3
+future = 5
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
@@ -100,7 +100,7 @@ def collate_batch(samples):
 class LitGNN(pl.LightningModule):
     def __init__(self, model, model_type, train_dataset, val_dataset, test_dataset, history_frames: int=3, future_frames: int=3, lr: float = 1e-3, 
                     batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1., rel_types: bool = False, 
-                    scale_factor=1, scene_id : int = 927, sample : str = None):
+                    scale_factor=1, scene_id : int = 927, sample : str = None, ckpt : str = None):
         super().__init__()
         self.model= model
         self.history_frames =history_frames
@@ -114,7 +114,8 @@ class LitGNN(pl.LightningModule):
         self.sample = sample
         self.cnt = 0
         self.scene = 0
-    
+        self.ckpt = ckpt
+
     def forward(self, graph, feats,e_w,snorm_n,snorm_e):
         # in lightning, forward defines the prediction/inference actions
         pred = self.model.inference(graph, feats,e_w,snorm_n,snorm_e)   
@@ -164,7 +165,7 @@ class LitGNN(pl.LightningModule):
         prediction_all_agents = []  # [num_agents, num_modes, n_timesteps, state_dim]
         if self.model_type == 'mtp':
             pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-            mode_prob = pred[:, -NUM_MODES:].clone()
+            mode_probs = pred[:, -NUM_MODES:].clone()
             desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
             prediction_all_agents = pred[:, :-NUM_MODES].clone().reshape(desired_shape)
             for j in range(1,labels_pos.shape[1]):
@@ -260,6 +261,7 @@ class LitGNN(pl.LightningModule):
             if self.model_type == 'mtp':
                 prediction = prediction_all_agents[idx, :]
                 prediction = torch.tensor([ convert_local_coords_to_global(prediction[i].cpu().numpy(), annotation['translation'], annotation['rotation']) for i in range(prediction.shape[0])])
+                probs = mode_probs[idx]
             else:
                 prediction = convert_local_coords_to_global(prediction[:,idx], annotation['translation'], annotation['rotation'])
                 
@@ -283,7 +285,7 @@ class LitGNN(pl.LightningModule):
                 future=np.vstack([future, future])
             
             # Plot predictions
-            if category != 'vehicle':
+            if category[0] != 'vehicle':
                 if 'sitting_lying_down' not in attribute:
                     if self.model_type == 'scout':
                         ax.plot(prediction[0, :, 0], prediction[0, :, 1], 'bo-',
@@ -295,7 +297,8 @@ class LitGNN(pl.LightningModule):
                             ax.plot(prediction[sample_num, :, 0], prediction[sample_num, :, 1], 'bo-',
                                     zorder=620,
                                     markersize=2,
-                                    linewidth=1, alpha=0.7)
+                                    linestyle = '--',
+                                    linewidth=0.8+probs[sample_num], alpha=0.7)
                     else:
                         for t in range(prediction.shape[1]):
                             try:
@@ -310,18 +313,20 @@ class LitGNN(pl.LightningModule):
                 if 'parked' not in attribute:
                     
                     if self.model_type == 'scout':
-
                         ax.plot(prediction[0, :, 0], prediction[0, :, 1], 'mo-',
                                 zorder=620,
                                 markersize=3,
                                 linewidth=2, alpha=0.7)
                     elif self.model_type == 'mtp':
                         for sample_num in range(prediction.shape[0]):
-                            ax.plot(prediction[sample_num, :, 0], prediction[sample_num, :, 1], 'ko-',
+                            color_sample = [line_colors[i % len(line_colors)] if probs[sample_num] == max(probs) else 'b'][0]
+                            ax.plot(prediction[sample_num, :, 0], prediction[sample_num, :, 1], 
                                     zorder=620,
-                                    color=line_colors[i % len(line_colors)],
-                                    markersize=5,
-                                    linewidth=3, alpha=0.7)
+                                    color='b',
+                                    linestyle = '--',
+                                    marker= 'o',
+                                    markersize=probs[sample_num]*3,
+                                    linewidth=0.8 + probs[sample_num], alpha=1)
                     else:
                         for t in range(prediction.shape[1]):
                             try:
@@ -379,7 +384,8 @@ class LitGNN(pl.LightningModule):
             
         
         #ax.axis('off')
-        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + '_MTP_sweptsw' + str(self.cnt) + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
+        run_name = self.ckpt.split('/')[6].split('-')[0]
+        fig.savefig(os.path.join(base_path, 'visualizations' , scene_name + '_MTP_3s_' + run_name + str(self.cnt) + '_' + sample_token + '.jpg'), dpi=300, bbox_inches='tight')
         print('Image saved in: ', os.path.join(base_path, 'visualizations' , scene_name + '_MTP_' + str(self.cnt) + '_' + sample_token + '.jpg'))
         plt.clf()
         self.cnt += 1
@@ -403,7 +409,8 @@ def main(args: Namespace):
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'))
     elif args.model_type == 'mtp':
         model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
+                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone,
+                        num_modes = NUM_MODES)
     else:
         model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
@@ -412,12 +419,13 @@ def main(args: Namespace):
     LitGNN_sys = LitGNN(model=model,  model_type = args.model_type,history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
                  test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id)
       
-    trainer = pl.Trainer(gpus=1, deterministic=True,  profiler=True) 
+    trainer = pl.Trainer(gpus=1, deterministic=True) 
  
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
-                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample)
+                    train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample,
+                    ckpt = args.ckpt)
 
-    
+
     trainer.test(LitGNN_sys)
    
 
@@ -428,7 +436,7 @@ if __name__ == '__main__':
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
     parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=2048)
+    parser.add_argument("--hidden_dims", type=int, default=512)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'scout', 'mtp'])
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -438,13 +446,13 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default='/media/14TBDISK/sandra/logs/NuScenes VAE/dark-deluge-1630/epoch=22-step=3081.ckpt', help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true')
-    parser.add_argument('--freeze', type=int, default=100, help="Layers to freeze in resnet18.")
+    parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
     parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN (bn) or GroupNorm (gn).")
 
     parser.add_argument('--maps', type=str2bool, nargs='?', const=True, default=True, help="Add HD Maps.")
-    parser.add_argument("--backbone", type=str, default='resnet18', help="Choose CNN backbone.",
+    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'mobilenet', 'resnet18','resnet50', 'map_encoder'])
-    parser.add_argument("--scene_id", type=int, default=None, help="Scene id to visualize.")
+    parser.add_argument("--scene_id", type=int, default=105, help="Scene id to visualize.")
     parser.add_argument("--sample", type=str, default=None, help="sample to visualize.")
     
     hparams = parser.parse_args()

@@ -168,10 +168,11 @@ Graph_InitialTests.ipynb
 ApolloScape
 ApolloScape_process.py
 models/GCN.py
-models/VAE_GNN.py
 
 events*
 sweep.yaml
 core
 *.tar
 *.tar.gz
+*.avi
+*.zip

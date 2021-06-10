@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
 from models.VAE_GNN import GAT_VAE
 from torchsummary import summary
-
+import efemarai as ef
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
 NUM_MODES = 3
@@ -88,9 +88,11 @@ class VAE_GNN_prior(nn.Module):
             dec_dims = z_dim + hidden_dim*2
         
         elif backbone == 'resnet18':       
-            self.feature_extractor = ResNet18(hidden_dim, freeze)
-            enc_dims = 2*hidden_dim + (output_dim-1) 
-            dec_dims = z_dim + hidden_dim*2
+            #self.feature_extractor = ResNet18(hidden_dim, freeze)
+            self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #[n, 512] #9 layers (con avgpool) - if freeze=8 train last conv block
+            
+            enc_dims = 512 + hidden_dim + (output_dim-1)  #2*hidden_dim + (output_dim-1) 
+            dec_dims = z_dim + hidden_dim + 512 #hidden_dim*2
         elif backbone == 'resnet50':       
             self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048]   #self.feature_extractor = ResNet50(hidden_dim, freeze)
             enc_dims = 2048 + hidden_dim + (output_dim-1)
@@ -120,16 +122,16 @@ class VAE_GNN_prior(nn.Module):
         #############
         #  ENCODER  #
         #############
-        self.GNN_enc = GAT_VAE(enc_dims, layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
-        encoder_dims = enc_dims*heads
-        self.MLP_encoder = MLP_Enc(encoder_dims+(output_dim-1), z_dim, dropout=dropout)
+        GNN_enc = GAT_VAE(enc_dims, layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
+        encoder_dims = enc_dims#*heads
+        MLP_encoder = MLP_Enc(encoder_dims+(output_dim-1), z_dim, dropout=dropout)
         
         #############
         #   PRIOR   #
         #############
-        self.GNN_prior = GAT_VAE(enc_dims-(output_dim-1),layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
-        encoder_dims = (enc_dims-(output_dim-1))*heads
-        self.MLP_prior = MLP_Enc(encoder_dims, z_dim, dropout=dropout)
+        GNN_prior = GAT_VAE(enc_dims-(output_dim-1),layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
+        encoder_dims = (enc_dims-(output_dim-1))#*heads
+        MLP_prior = MLP_Enc(encoder_dims, z_dim, dropout=dropout)
         
 
         #############
@@ -137,18 +139,17 @@ class VAE_GNN_prior(nn.Module):
         ############# 
         #self.embedding_z = nn.Linear(z_dim, hidden_dim)
         #dec_dims = hidden_dim 
-        self.GNN_decoder = GAT_VAE(dec_dims, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=False, ew_dims=ew_dims) #If att_ew --> embedding_e_dec
-        self.MLP_decoder = MLP_Dec(dec_dims*heads+z_dim, dec_dims, output_dim, dropout)
-
-        self.base = nn.ModuleList([
-            self.GNN_enc,
-            self.MLP_encoder,
-            self.GNN_prior,
-            self.MLP_prior,
-            #self.embedding_z,
-            self.GNN_decoder,
-            self.MLP_decoder
-        ])
+        GNN_decoder = GAT_VAE(dec_dims, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=False, ew_dims=ew_dims) #If att_ew --> embedding_e_dec
+        MLP_decoder = MLP_Dec(dec_dims+z_dim, dec_dims, output_dim, dropout) #dec_dims*heads
+        
+        self.base = nn.ModuleDict({
+            'GNN_enc':      GNN_enc,
+            'MLP_encoder':  MLP_encoder,
+            'GNN_prior':    GNN_prior,
+            'MLP_prior':    MLP_prior,
+            'GNN_decoder':  GNN_decoder,
+            'MLP_decoder':  MLP_decoder
+        })
 
         if self.bn:
             self.bn_enc = nn.BatchNorm1d(enc_dims) 
@@ -204,9 +205,9 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_enc(h)
 
-        h = self.GNN_enc(g, h, e_w, snorm_n)
+        h = self.base['GNN_enc'](g, h, e_w, snorm_n)
         h = torch.cat([h, gt], dim=-1)            
-        mu, log_var = self.MLP_encoder(h)   # Latent distribution
+        mu, log_var = self.base['MLP_encoder'](h)   # Latent distribution
         
         return mu, log_var
     
@@ -220,9 +221,9 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_enc(h_prior)
 
-        h_prior = self.GNN_prior(g, h_prior, e_w, snorm_n)    
+        h_prior = self.base['GNN_prior'](g, h_prior, e_w, snorm_n)    
 
-        mu_prior, log_var_prior = self.MLP_prior(h_prior)   # Latent distribution
+        mu_prior, log_var_prior = self.base['MLP_prior'](h_prior)   # Latent distribution
 
         return mu_prior, log_var_prior
         
@@ -236,10 +237,10 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_dec(h_dec)
             
-        h_dec = self.GNN_decoder(g,h_dec,e_w,snorm_n)
+        h_dec = self.base['GNN_decoder'](g,h_dec,e_w,snorm_n)
         h_dec = torch.cat([h_dec, z_sample],dim=-1)
 
-        return self.MLP_decoder(h_dec) 
+        return self.base['MLP_decoder'](h_dec) 
 
     
     def inference(self, g, feats, e_w, snorm_n,snorm_e, maps):
@@ -256,7 +257,8 @@ class VAE_GNN_prior(nn.Module):
         maps_emb = self.feature_extractor(maps)
 
         #### PRIOR ####
-        z_sample, mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
+        mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
+        z_sample = self.reparameterize(mu_prior, log_var_prior)
         
         #### DECODE ####      
         recon_y = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
@@ -271,7 +273,7 @@ class VAE_GNN_prior(nn.Module):
 
         ####  EMBEDDINGS  ####
         # Map encoding
-        maps_emb = self.feature_extractor(maps)
+        maps_emb = self.feature_extractor(maps.contiguous())
         # Input embedding
         #h = torch.cat([maps_emb.flatten(start_dim=1),feats], dim=-1)
         h_emb = self.embedding_h(feats) 
@@ -282,10 +284,9 @@ class VAE_GNN_prior(nn.Module):
         #### PRIOR ####
         mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
-        #### DECODE ####      
-        '''
+        #### DECODE #### 
+        '''     
         pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
-
         for i in range(NUM_MODES):
             #### Sample from the latent distribution ###
             z_sample = self.reparameterize(mu_prior, log_var_prior)
@@ -298,20 +299,20 @@ class VAE_GNN_prior(nn.Module):
         pred = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
 
         return pred[:,:-1], pred[:,-1], [mu, log_var, mu_prior, log_var_prior], z_sample
-
+        
 
 if __name__ == '__main__':
     history_frames = 5
     future_frames = 12
     hidden_dims = 128
-    heads = 1
+    heads = 2
 
     input_dim = 7*(history_frames-1)
     output_dim = 2*future_frames + 1
 
     model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet18')
     #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
 
@@ -319,6 +320,8 @@ if __name__ == '__main__':
         batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene = batch
         e_w = batched_graph.edata['w']
         #e_w= e_w.unsqueeze(1)
+        #y = model.inference(batched_graph, feats, e_w,snorm_n,snorm_e, maps)
+        
         y, prob,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
         print(y.shape)
 

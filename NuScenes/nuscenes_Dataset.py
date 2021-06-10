@@ -19,8 +19,8 @@ import cv2
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
-history = 2
-future = 6
+history = 3
+future = 5
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames + 1#2s of history + 6s of prediction
@@ -80,18 +80,18 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
-        self.map_path = os.path.join(base_path, 'hd_maps_ego') 
+        self.map_path = os.path.join(base_path, 'hd_maps_3s') 
         self.future_frames = future_frames
         self.types = rel_types
         self.local_frame = local_frame
-
-        if train_val_test == 'train':
-            self.raw_dir =os.path.join(base_path, 'ns_step1_train.pkl' )#train_val_test = 'train_filter'
-        else:
-            self.raw_dir = os.path.join(base_path,'ns_challenge_json_test.pkl')
-            self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
         
-        #self.raw_dir = os.path.join(base_path,'nuscenes_' + train_val_test + '.pkl')
+        if train_val_test == 'train':
+            self.raw_dir =os.path.join(base_path, 'ns_3s_train.pkl' )#train_val_test = 'train_filter'
+        else:
+            self.raw_dir = os.path.join(base_path,'ns_3s_test.pkl')
+            #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
+        
+        #self.raw_dir = os.path.join(base_path,'ns_step1_train' + train_val_test + '.pkl')
         self.challenge_eval = challenge_eval
         self.transform = transforms.Compose(
                             [
@@ -115,7 +115,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_tokens = self.all_tokens[20:]
             '''
         if self.train_val_test == 'train': 
-            with open(os.path.join(base_path,'ns_step1_val.pkl'), 'rb') as reader:
+            with open(os.path.join(base_path,'ns_3s_val.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
             self.all_feature = np.vstack((self.all_feature, all_feature))
             self.all_adjacency = np.vstack((self.all_adjacency,all_adjacency))
@@ -170,10 +170,10 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if self.local_frame:
             all_feature = self.all_feature.clone()
             for seq in range(self.all_feature.shape[0]):
-                index = torch.tensor( [ int(mask_i.nonzero()[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-1]])
+                index = torch.tensor( [ int(torch.nonzero(mask_i)[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-1]])
                 all_feature[seq,:self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq]-1)])
                 # Convert ego feats
-                index = self.all_feature[seq, self.num_visible_object[seq]-1, :history_frames, 0].nonzero()[0][0]
+                index = torch.nonzero(self.all_feature[seq, self.num_visible_object[seq]-1, :history_frames, 0])[0][0]
                 all_feature[seq,self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,self.num_visible_object[seq]-1,index:history_frames,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,2], True)])
                 
                 all_feature[seq,:self.num_visible_object[seq],history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq])])
@@ -242,7 +242,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if self.local_frame:
             empty_agents= []
             for i,feat_i in enumerate(feats):
-                if not feat_i.any():
+                if not torch.any(feat_i):
                     empty_agents.append(i)
             idx_with_data = list(set(range(len(feats))) - set(empty_agents))
             feats = feats[idx_with_data] 
@@ -255,9 +255,9 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         
         #img=((maps-maps.min())*255/(maps.max()-maps.min())).numpy()
         #cv2.imwrite('input_276_0_gray'+sample_token+'.png',cv2.cvtColor(img[0].transpose(1,2,0), cv2.COLOR_RGB2BGR))
-        if maps.shape[0] != feats.shape[0]:
-            print('stop')
+        
         scene_id = int(self.scene_ids[idx])
+        
         if self.challenge_eval:
             return graph, output_mask, feats, gt, tokens, scene_id, self.all_mean_xy[idx,:2], maps , global_feats
             
@@ -265,7 +265,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True, local_frame=True)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True, local_frame=True)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
     test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_test) )
