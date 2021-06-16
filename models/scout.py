@@ -142,8 +142,8 @@ class My_GATLayer(nn.Module):
       
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
-        nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='relu')
-        nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='relu')
+        #nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='relu')
+        #nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='relu')
         nn.init.kaiming_normal_(self.attention_func.weight, a=0.02, nonlinearity='leaky_relu')
         
     
@@ -180,7 +180,7 @@ class My_GATLayer(nn.Module):
             h =  g.ndata['h'] #+g.ndata['h_s'] 
             #h = h * snorm_n # normalize activation w.r.t. graph node size
             if self.relu:
-                h = torch.relu(h) # non-linear activation
+                h = F.selu(h) # non-linear activation #DEAD RELU
             if self.res_con:
                 h = h_in + h # residual connection           
             return h #graph.ndata.pop('h') - another option to g.local_scope()

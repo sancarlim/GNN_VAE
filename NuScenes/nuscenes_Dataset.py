@@ -80,7 +80,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
-        self.map_path = os.path.join(base_path, 'hd_maps_3s') 
+        self.map_path = os.path.join(base_path, 'hd_maps_3') 
         self.future_frames = future_frames
         self.types = rel_types
         self.local_frame = local_frame
@@ -88,7 +88,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if train_val_test == 'train':
             self.raw_dir =os.path.join(base_path, 'ns_3s_train.pkl' )#train_val_test = 'train_filter'
         else:
-            self.raw_dir = os.path.join(base_path,'ns_3s_test.pkl')
+            self.raw_dir = os.path.join(base_path,'ns_3s_test.pkl')  #ns_challenge_json_3s_test.pkl
             #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
         
         #self.raw_dir = os.path.join(base_path,'ns_step1_train' + train_val_test + '.pkl')
@@ -114,6 +114,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_mean_xy = self.all_mean_xy[20:]
             self.all_tokens = self.all_tokens[20:]
             '''
+        
         if self.train_val_test == 'train': 
             with open(os.path.join(base_path,'ns_3s_val.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
@@ -258,6 +259,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         
         scene_id = int(self.scene_ids[idx])
         
+        if maps.shape[0] != feats.shape[0]:
+            print('stop')
         if self.challenge_eval:
             return graph, output_mask, feats, gt, tokens, scene_id, self.all_mean_xy[idx,:2], maps , global_feats
             
@@ -265,7 +268,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True, local_frame=True)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True, local_frame=True)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
     test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_test) )

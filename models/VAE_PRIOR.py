@@ -266,10 +266,10 @@ class VAE_GNN_prior(nn.Module):
         return recon_y
 
  
-    def forward(self, g, feats, e_w, snorm_n, snorm_e, gt, maps):
+    def forward(self, g, features, e_w, snorm_n, snorm_e, labels, maps):
         # Reshape from (B*V,T,C) to (B*V,T*C) 
-        feats = feats.contiguous().view(feats.shape[0],-1)
-        gt = gt.contiguous().view(gt.shape[0],-1)
+        feats = features.contiguous().view(features.shape[0],-1)
+        gt = labels.contiguous().view(labels.shape[0],-1)
 
         ####  EMBEDDINGS  ####
         # Map encoding
@@ -285,7 +285,7 @@ class VAE_GNN_prior(nn.Module):
         mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
         #### DECODE #### 
-        '''     
+        
         pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
         for i in range(NUM_MODES):
             #### Sample from the latent distribution ###
@@ -299,7 +299,7 @@ class VAE_GNN_prior(nn.Module):
         pred = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
 
         return pred[:,:-1], pred[:,-1], [mu, log_var, mu_prior, log_var_prior], z_sample
-        
+        '''
 
 if __name__ == '__main__':
     history_frames = 5
