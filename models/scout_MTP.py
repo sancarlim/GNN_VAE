@@ -1,4 +1,6 @@
 import sys
+
+from torch._C import device
 sys.path.append('..')
 import dgl
 import torch
@@ -18,109 +20,6 @@ from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
-
-class GATConv(nn.Module):
-    def __init__(self,
-                 in_feats,
-                 out_feats,
-                 num_heads,
-                 feat_drop=0.,
-                 attn_drop=0.,
-                 negative_slope=0.2,
-                 residual=False,
-                 activation=None):
-        super(GATConv, self).__init__()
-        self._num_heads = num_heads
-        self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
-        self._out_feats = out_feats
-        self.fc = nn.Linear(self._in_src_feats, out_feats * num_heads, bias=False)
-        self.attn_l = nn.Parameter(th.FloatTensor(size=(1, num_heads, out_feats)))
-        self.attn_r = nn.Parameter(th.FloatTensor(size=(1, num_heads, out_feats)))
-        self.feat_drop = nn.Dropout(feat_drop)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.leaky_relu = nn.LeakyReLU(negative_slope)
-        if residual:
-            if self._in_dst_feats != out_feats:
-                self.res_fc = nn.Linear(self._in_dst_feats, num_heads * out_feats, bias=False)
-            else:
-                self.res_fc = Identity()
-        else:
-            self.register_buffer('res_fc', None)
-        self.reset_parameters()
-        self.activation = activation
-
-    def reset_parameters(self):
-        """
-        Description
-        -----------
-        Reinitialize learnable parameters.
-        Note
-        ----
-        The fc weights :math:`W^{(l)}` are initialized using Glorot uniform initialization.
-        The attention weights are using xavier initialization method.
-        """
-        gain = nn.init.calculate_gain('relu')
-        if hasattr(self, 'fc'):
-            nn.init.xavier_normal_(self.fc.weight, gain=gain)
-        else:
-            nn.init.xavier_normal_(self.fc_src.weight, gain=gain)
-            nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
-        nn.init.xavier_normal_(self.attn_l, gain=gain)
-        nn.init.xavier_normal_(self.attn_r, gain=gain)
-        if isinstance(self.res_fc, nn.Linear):
-            nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
-
-    def forward(self, graph, feat, get_attention=False):
-        with graph.local_scope():
-            if (graph.in_degrees() == 0).any():
-                raise DGLError('There are 0-in-degree nodes in the graph, '
-                                'output for those nodes will be invalid. '
-                                'This is harmful for some applications, '
-                                'causing silent performance regression. '
-                                'Adding self-loop on the input graph by '
-                                'calling `g = dgl.add_self_loop(g)` will resolve '
-                                'the issue. Setting ``allow_zero_in_degree`` '
-                                'to be `True` when constructing this module will '
-                                'suppress the check and let the code run.')
-
-            
-            h_src = h_dst = self.feat_drop(feat)
-            feat_src = feat_dst = self.fc(h_src).view(-1, self._num_heads, self._out_feats)
-
-            # NOTE: GAT paper uses "first concatenation then linear projection"
-            # to compute attention scores, while ours is "first projection then
-            # addition", the two approaches are mathematically equivalent:
-            # We decompose the weight vector a mentioned in the paper into
-            # [a_l || a_r], then a^T [Wh_i || Wh_j] = a_l Wh_i + a_r Wh_j
-            # Our implementation is much efficient because we do not need to
-            # save [Wh_i || Wh_j] on edges, which is not memory-efficient. Plus,
-            # addition could be optimized with DGL's built-in function u_add_v,
-            # which further speeds up computation and saves memory footprint.
-            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
-            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
-            graph.srcdata.update({'ft': feat_src, 'el': el})
-            graph.dstdata.update({'er': er})
-            # compute edge attention, el and er are a_l Wh_i and a_r Wh_j respectively.
-            graph.apply_edges(fn.u_add_v('el', 'er', 'e'))
-            e = self.leaky_relu(graph.edata.pop('e'))
-            # compute softmax
-            graph.edata['a'] = self.attn_drop(edge_softmax(graph, e))
-            # message passing
-            graph.update_all(fn.u_mul_e('ft', 'a', 'm'),
-                             fn.sum('m', 'ft'))
-            rst = graph.dstdata['ft']
-            # residual
-            if self.res_fc is not None:
-                resval = self.res_fc(h_dst).view(h_dst.shape[0], -1, self._out_feats)
-                rst = rst + resval
-            # activation
-            if self.activation:
-                rst = self.activation(rst)
-
-            if get_attention:
-                return rst, graph.edata['a']
-            else:
-                return rst
 
 class PositionalEncoding(nn.Module):
 
@@ -157,16 +56,18 @@ class My_GATLayer(nn.Module):
         self.feat_drop_l = nn.Dropout(feat_drop)
         self.attn_drop_l = nn.Dropout(attn_drop)   
         self.res_con = res_connection
+        self.leaky_relu = nn.LeakyReLU(0.2)
         self.reset_parameters()
+
       
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
-        gain = torch.nn.init.calculate_gain('selu', param=None)
+        gain = torch.nn.init.calculate_gain('linear', param=None)
         nn.init.xavier_normal_(self.linear_self.weight, gain)
         nn.init.xavier_normal_(self.linear_func.weight, gain)
-        ##nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='relu')
-        ##nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='relu')
-        nn.init.kaiming_normal_(self.attention_func.weight, a=0.02, nonlinearity='leaky_relu')
+        ##nn.init.kaiming_normal_(self.linear_self.weight, a=0.2, nonlinearity='leaky_relu')
+        ##nn.init.kaiming_normal_(self.linear_func.weight, a=0.2, nonlinearity='leaky_relu')
+        nn.init.kaiming_normal_(self.attention_func.weight, a=0.2, nonlinearity='leaky_relu')
         
     
     def edge_attention(self, edges):
@@ -176,7 +77,7 @@ class My_GATLayer(nn.Module):
            concat_z = torch.cat([edges.src['z'], edges.dst['z'], edges.data['w']], dim=-1) 
         
         src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
-        src_e = F.leaky_relu(src_e)
+        src_e = self.leaky_relu(src_e)
         return {'e': src_e}
     
     def message_func(self, edges):
@@ -324,18 +225,17 @@ class SCOUT_MTP(nn.Module):
 
         if heads == 1:
             gat_1 = My_GATLayer(self.hidden_dim, self.hidden_dim, e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection) #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu) 
-            gat_2 = My_GATLayer(self.hidden_dim, self.hidden_dim,  e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection)  #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu)
-            linear1 = nn.Linear(self.hidden_dim, output_dim * self.num_modes)
+            #gat_2 = My_GATLayer(self.hidden_dim, self.hidden_dim,  e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection)  #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu)
+            gat_2 = MultiHeadGATLayer(self.hidden_dim, self.hidden_dim,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='cat', res_connection=res_connection ,num_heads=self.num_modes, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
+        
+            #linear1 = nn.Linear(self.hidden_dim, output_dim * self.num_modes)
         else:
             gat_1 = MultiHeadGATLayer(self.hidden_dim, self.hidden_dim, e_dims=self.hidden_dim//2*2,res_weight=res_weight, merge='cat', res_connection=res_connection , num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) #GATConv(hidden_dim, hidden_dim, heads,feat_drop, attn_drop,residual=True, activation='relu')
             #self.embedding_e2 = nn.Linear(2, hidden_dims*heads) if ew_type else nn.Linear(1, hidden_dims*heads)
             gat_2 = MultiHeadGATLayer(self.hidden_dim*heads, self.hidden_dim*heads,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='cat', res_connection=res_connection ,num_heads=self.num_modes, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
         
-            #linear1 = nn.Linear(self.hidden_dim * heads * self.num_modes, 2 * self.num_modes ) if self.emb_type=='pos_enc' else nn.Linear(self.hidden_dim * heads * self.num_modes, output_dim * self.num_modes) #nn.ModuleList()
-            '''
-            for i in range(NUM_MODES):
-                self.linear1.append( nn.Linear(self.hidden_dim, output_dim) )
-            '''
+        linear1 = nn.Linear(self.hidden_dim * heads * self.num_modes, 2 * self.num_modes ) if self.emb_type=='pos_enc' else nn.Linear(self.hidden_dim * heads * self.num_modes, output_dim * self.num_modes) #nn.ModuleList()
+            
             
         if dropout:
             self.dropout_l = nn.Dropout(dropout, inplace=False)
@@ -357,7 +257,7 @@ class SCOUT_MTP(nn.Module):
           'resize_e2': resize_e2,
           'gat2': gat_2
         })
-
+        '''
         ###############
         # DECODER_GRU #
         ###############
@@ -365,13 +265,14 @@ class SCOUT_MTP(nn.Module):
         dec_gru = nn.GRUCell(self.hidden_dim * heads * self.num_modes, emb_dim * num_modes)
         # Once we decode over T frames we output final traj + prob
         linear1 = nn.Linear(5 * emb_dim * self.num_modes, self.output_dim * self.num_modes ) 
-        # OPTION 2  ,  gat_2
-        ##self.dec_gru = nn.GRUCell(self.hidden_dim * heads, emb_dim)
+        # OPTION 2  ,  gat_2 merge=list
+        ##dec_gru = nn.GRUCell(self.hidden_dim * heads, emb_dim)
         # Once we decode over T frames we output final traj + prob
-        ##linear1 = nn.Linear(5 * emb_dim, self.output_dim) 
+        ##linear1 = nn.Linear(5 * emb_dim * self.num_modes, self.output_dim * self.num_modes)  #A) nn.Linear(5 * emb_dim * self.num_modes, self.output_dim) 
         self.base['dec'] = dec_gru
+        '''
         self.base['linear1'] = linear1
-
+        
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -383,7 +284,7 @@ class SCOUT_MTP(nn.Module):
             nn.init.constant_(self.group_norm.weight, 1)
             nn.init.constant_(self.group_norm.bias, 0)
         #nn.init.kaiming_normal_(self.embedding_h[0].weight, nonlinearity='leaky_relu', a=0.2)
-        nn.init.xavier_normal_(self.embeddings['embedding_h'].weight, torch.nn.init.calculate_gain('selu'))
+        nn.init.kaiming_normal_(self.embeddings['embedding_h'].weight, torch.nn.init.calculate_gain('linear'))
         ''' 
         OTRA OPCION
         fan_in = self.embeddings['embedding_h'].in_features
@@ -444,22 +345,28 @@ class SCOUT_MTP(nn.Module):
             g.edata['w'] = e 
         
         h_modes = self.base['gat2'](g, h, snorm_n)  #BN Y RELU DENTRO DE LA GAT_LAYER
-
+        '''
         y = torch.zeros(5, feats.shape[0], self.emb_dim * self.num_modes).float().to(h_modes.device)
-        h = h_enc.repeat(1,3)
+        h = h_enc.repeat(1,self.num_modes)
+        #y = torch.zeros((self.num_modes, 5, feats.shape[0], self.emb_dim), device=h.device)
+        #y_out = torch.zeros((self.num_modes, feats.shape[0], self.output_dim), device=h.device)
         #for i, mode in enumerate(h_modes):
         for t in range(5):
             h = self.base['dec'](h_modes, h)
             y[t] = h
+        '''
+        y = self.dropout_l(h_modes)
         
-        y = self.dropout_l(y)
-        y = self.base['linear1'](y.view(feats.shape[0], -1))
-        
+        y = self.base['linear1'](y)
+    
+        #y =  self.base['linear1'](h_modes)
         if self.emb_type == 'pos_enc':
             y = y.view(y.shape[0],-1)
 
         mode_probabilities = torch.cat([y[:, self.output_dim * i - 1].unsqueeze(1) for i in range(1,self.num_modes+1)], dim=1)
         predictions = torch.cat([y[:, self.output_dim * (i-1) : self.output_dim*i - 1]  for i in  range(1,self.num_modes+1)], dim=1)
+        ##mode_probabilities = y_out[:, :, - 1].transpose(0,1)
+        ##predictions = y_out[:,:,:-1].contiguous().view(feats.shape[0],-1)
 
         # Normalize the probabilities to sum to 1 for inference.
         ##mode_probabilities = y[:, -self.num_modes:].clone()
@@ -474,14 +381,15 @@ class SCOUT_MTP(nn.Module):
 if __name__ == '__main__':
 
     history_frames = 7
-    future_frames = 6
+    future_frames = 5
     hidden_dims = 768
     heads = 2
+    emb_type = 'pos_enc'
 
-    input_dim = 7*(history_frames)
+    input_dim = 7 if emb_type != 'emb' else 7*(history_frames)
     output_dim = 2*future_frames + 1
 
-    model = SCOUT_MTP(input_dim=input_dim, hidden_dim=hidden_dims, emb_dim=512, emb_type='emb', output_dim=output_dim, heads=heads,  ew_dims= True,
+    model = SCOUT_MTP(input_dim=input_dim, hidden_dim=hidden_dims, emb_dim=512, emb_type=emb_type, output_dim=output_dim, heads=heads,  ew_dims= True,
                    dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=False, backbone='resnet50', freeze=True)
     
     
