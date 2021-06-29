@@ -154,7 +154,7 @@ class My_GATLayer(nn.Module):
            concat_z = torch.cat([edges.src['z'], edges.dst['z'], edges.data['w']], dim=-1) 
         
         src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
-        src_e = F.leaky_relu(src_e)
+        src_e = F.selu(src_e)
         return {'e': src_e}
     
     def message_func(self, edges):
@@ -177,7 +177,7 @@ class My_GATLayer(nn.Module):
             g.ndata['z'] = self.linear_func(h) 
             g.apply_edges(self.edge_attention)
             g.update_all(self.message_func, self.reduce_func)
-            h =  g.ndata['h'] #+g.ndata['h_s'] 
+            h = g.ndata['h'] #+g.ndata['h_s'] 
             #h = h * snorm_n # normalize activation w.r.t. graph node size
             if self.relu:
                 h = F.selu(h) # non-linear activation #DEAD RELU
@@ -203,6 +203,8 @@ class MultiHeadGATLayer(nn.Module):
         if self.merge == 'cat':
             # concat on the output feature dimension (dim=1), for intermediate layers
             return torch.cat(head_outs, dim=1)
+        elif self.merge == 'list':
+            return head_outs
         else:
             # merge using average, for final layer
             return torch.mean(torch.stack(head_outs, dim=1),dim=1)

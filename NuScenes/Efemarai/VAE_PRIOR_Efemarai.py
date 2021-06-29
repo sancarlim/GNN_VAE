@@ -1,19 +1,14 @@
-from discriminator import Discriminator
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
-import matplotlib.pyplot as plt
 from torchvision.models import resnet18, resnet50
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
 from torch.utils.data import DataLoader
-from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
 from models.VAE_GNN import GAT_VAE
-from torchsummary import summary
-import efemarai as ef
-from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
 
 class MLP_Enc(nn.Module):
@@ -68,7 +63,7 @@ class MLP_Dec(nn.Module):
 class VAE_GNN_prior(nn.Module):
     def __init__(self, input_dim = 24, hidden_dim = 128, z_dim = 25, output_dim = 12, fc = False, dropout = 0.2, feat_drop = 0., 
                     attn_drop = 0., heads = 1, att_ew = True, ew_dims = 1, backbone = 'map_encoder', freeze = 6,
-                    bn=False, gn=False, encoding_type = 'emb', num_modes = 5):
+                    bn=False, gn=False, encoding_type = 'emb', num_modes = 3):
         super().__init__()
         self.heads = heads
         self.fc = fc
@@ -76,48 +71,18 @@ class VAE_GNN_prior(nn.Module):
         self.bn = bn
         self.gn = gn
         self.encoding_type = encoding_type
+
         self.num_modes =  num_modes
 
         ###############
         # Map Encoder #
         ###############
-        if backbone == 'map_encoder':
-            self.feature_extractor = My_MapEncoder(input_channels = 3, input_size=128, 
-                                                    hidden_channels = [16,32,32,64], output_size = hidden_dim, 
-                                                    kernels = [5,5,3,3], strides = [1,2,2,2])
-            enc_dims = hidden_dim*2+(output_dim-1)    
-            dec_dims = z_dim + hidden_dim*2
-        
-        elif backbone == 'resnet18':       
-            #self.feature_extractor = ResNet18(hidden_dim, freeze)
-            self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #[n, 512] #9 layers (con avgpool) - if freeze=8 train last conv block
-            
-            enc_dims = 512 + hidden_dim + (output_dim-1)  #2*hidden_dim + (output_dim-1) 
-            dec_dims = z_dim + hidden_dim + 512 #hidden_dim*2
-        elif backbone == 'resnet50':       
-            self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048]   #self.feature_extractor = ResNet50(hidden_dim, freeze)
-            enc_dims = 2048 + hidden_dim + (output_dim-1)
-            dec_dims = z_dim + hidden_dim + 2048
-        
-        elif backbone == 'resnet_gray':
-            resnet = resnet18(pretrained=False)
-            modules = list(resnet.children())[:-3]
-            modules.append(torch.nn.AdaptiveAvgPool2d((1, 1))) 
-            modules[0] = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3,bias=False)  #stride=1 if list[:-1]
-            nn.init.kaiming_normal_(modules[0].weight, mode='fan_out', nonlinearity='relu')
-            self.feature_extractor=torch.nn.Sequential(*modules)   
-            enc_dims = hidden_dim + output_dim + 256
-            dec_dims = z_dim + hidden_dim + 256
-
-
+        enc_dims = 512 + hidden_dim + (output_dim-1)  #2*hidden_dim + (output_dim-1) 
+        dec_dims = z_dim + hidden_dim + 512 #hidden_dim*2
+       
         ############################
         # Input Features Embedding #
         ############################
-
-        ################# NO MAPS
-        #enc_dims = hidden_dim + output_dim
-        #dec_dims = hidden_dim + z_dim
-        ###############
         if encoding_type == 'emb':
             self.embedding_h = nn.Linear(input_dim, hidden_dim)  
         else:
@@ -255,7 +220,7 @@ class VAE_GNN_prior(nn.Module):
         return self.base['MLP_decoder'](h_dec) 
 
     
-    def inference(self, g, features, e_w, snorm_n,snorm_e, maps):
+    def inference(self, g, features, e_w, snorm_n,snorm_e):
         """
         Samples from a normal distribution and decodes conditioned to the GNN outputs.   
         """
@@ -268,7 +233,7 @@ class VAE_GNN_prior(nn.Module):
         else:
             h_emb = self.encode_h(self.leaky_relu(self.embedding_h(features)))[1].squeeze() 
         # Maps feature extraction
-        maps_emb = self.feature_extractor(maps)
+        maps_emb = torch.rand(features.shape[0], 512).to('cuda:0')
 
         #### PRIOR ####
         mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
@@ -280,14 +245,14 @@ class VAE_GNN_prior(nn.Module):
         return pred[:,:-1], pred[:,-1], [mu_prior, log_var_prior], z_sample
 
  
-    def forward(self, g, features, e_w, snorm_n, snorm_e, labels, maps):
+    def forward(self, g, features, e_w, snorm_n, snorm_e, labels):
         # Reshape from (B*V,T,C) to (B*V,T*C) 
         gt = labels.contiguous().view(labels.shape[0],-1)
 
         ####  EMBEDDINGS  ####
         # Map encoding
-        maps_emb = self.feature_extractor(maps.contiguous())
-       ####  EMBEDDINGS  ####
+        maps_emb = torch.rand(features.shape[0], 512).to('cuda:0')
+        ####  EMBEDDINGS  ####
         if self.encoding_type == 'emb':
             # Reshape from (B*V,T,C) to (B*V,T*C) 
             feats = features.contiguous().view(features.shape[0],-1)
@@ -300,12 +265,12 @@ class VAE_GNN_prior(nn.Module):
         mu, log_var = self.encode(g, h_emb, e_w, snorm_n, maps_emb, gt)
 
         #### PRIOR ####
-        mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
+        mu_prior = log_var_prior = 0.1 #mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
         #### DECODE #### 
         
         pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
-        for _ in range(self.num_modes):
+        for i in range(self.num_modes):
             #### Sample from the latent distribution ###
             z_sample = self.reparameterize(mu, log_var)
             pred.append( self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample) )#torch.cat( ,  dim = 0) # 3, N, 25
@@ -329,7 +294,7 @@ if __name__ == '__main__':
     output_dim = 2*future_frames + 1
 
     model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., 
-                    heads=2,att_ew=True, ew_dims=2, backbone='resnet18', encoding_type='pos_enc')
+                    heads=2,att_ew=True, ew_dims=2, backbone='resnet18', encoding_type='gru')
     #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)

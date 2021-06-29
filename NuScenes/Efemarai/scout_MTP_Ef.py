@@ -2,6 +2,7 @@ import sys
 sys.path.append('..')
 import dgl
 import torch
+import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import os
@@ -12,14 +13,7 @@ from torchvision.models import resnet18
 from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
-import utils
-from nuscenes.nuscenes import NuScenes
-from nuscenes.prediction import PredictHelper
-
-
-DATAROOT = '/media/14TBDISK/nuscenes'
-nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
-helper = PredictHelper(nuscenes)
+import efemarai as ef
 
 class PositionalEncoding(nn.Module):
 
@@ -38,7 +32,7 @@ class PositionalEncoding(nn.Module):
         self.pe = nn.Parameter(torch.randn(1,max_len, d_model))
 
     def forward(self, x):
-        x = x + self.pe[:,:x.size(1), :]  #x is N,T,512 + (1,T,512) 
+        x = x + self.pe[:,:x.size(1), :] 
         return self.dropout(x)
 
 
@@ -65,8 +59,6 @@ class My_GATLayer(nn.Module):
         gain = torch.nn.init.calculate_gain('linear', param=None)
         nn.init.xavier_normal_(self.linear_self.weight, gain)
         nn.init.xavier_normal_(self.linear_func.weight, gain)
-        ##nn.init.kaiming_normal_(self.linear_self.weight, a=0.2, nonlinearity='leaky_relu')
-        ##nn.init.kaiming_normal_(self.linear_func.weight, a=0.2, nonlinearity='leaky_relu')
         nn.init.kaiming_normal_(self.attention_func.weight, a=0.2, nonlinearity='leaky_relu')
         
     
@@ -77,7 +69,8 @@ class My_GATLayer(nn.Module):
            concat_z = torch.cat([edges.src['z'], edges.dst['z'], edges.data['w']], dim=-1) 
         
         src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
-        src_e = self.leaky_relu(src_e)
+        ef.set_name(src_e, "src_e")
+        src_e = F.leaky_relu(src_e)
         return {'e': src_e}
     
     def message_func(self, edges):
@@ -87,6 +80,7 @@ class My_GATLayer(nn.Module):
         h_s = nodes.data['h_s']      
         #Attention score
         a = self.attn_drop_l(   F.softmax(nodes.mailbox['e'], dim=-1)  )  #attention score between nodes i and j
+        ef.set_name(a, "att_score")
         h = h_s + torch.sum(a * nodes.mailbox['z'], dim=1)
         return {'h': h}
                                
@@ -103,10 +97,10 @@ class My_GATLayer(nn.Module):
             h =  g.ndata['h'] #+g.ndata['h_s'] 
             #h = h * snorm_n # normalize activation w.r.t. graph node size
             if self.relu:
-                h = torch.relu(h) # non-linear activation
+                h = F.selu(h) 
             if self.res_con:
-                h = h_in + h # residual connection           
-            return h #graph.ndata.pop('h') - another option to g.local_scope()
+                h = h_in + h            
+            return h 
 
 
 class MultiHeadGATLayer(nn.Module):
@@ -137,7 +131,7 @@ class SCOUT_MTP(nn.Module):
     
     def __init__(self, input_dim, hidden_dim, emb_dim, output_dim, dropout=0.2, bn=False, gn=False, 
                 feat_drop=0., attn_drop=0., heads=1,att_ew=False, res_weight=True, emb_type = 'emb',
-                res_connection=True, ew_dims=False,  backbone='mobilenet', freeze=0, num_modes=3, history_frames=7):
+                res_connection=True, ew_dims=False,  backbone='mobilenet', freeze=0, num_modes=3):
         super().__init__()
 
         self.heads = heads
@@ -169,7 +163,7 @@ class SCOUT_MTP(nn.Module):
             self.feature_extractor = torch.nn.Sequential(*list(model_ft.children())[:-1]) 
             hidden_dims = hidden_dim+512
             '''
-
+        '''
         elif backbone == 'mobilenet':       
             self.feature_extractor = MobileNetBackbone('mobilenet_v2', freeze = freeze)  #returns [n,1280] # 18 layers
             #self.hidden_dim = hidden_dim + 1280
@@ -193,8 +187,8 @@ class SCOUT_MTP(nn.Module):
 
         else:
             feature_extractor = None
-
-        backbone_feature_dim = calculate_backbone_feature_dim(feature_extractor, input_shape = (3,224,224)) if backbone != 'None' else 0
+        '''
+        backbone_feature_dim = 512#calculate_backbone_feature_dim(feature_extractor, input_shape = (3,224,224)) if backbone != 'None' else 0
         '''
         embedding_h = nn.Linear(input_dim, backbone_feature_dim//4)###//2)
         self.hidden_dim = backbone_feature_dim//8 + backbone_feature_dim # hidden_dim + backbone_feature_dim
@@ -203,7 +197,7 @@ class SCOUT_MTP(nn.Module):
         self.hidden_dim = hidden_dim
         '''
         if emb_type == 'gru':
-            embedding_h = nn.Linear(input_dim, emb_dim//2)     #self.embedding_h = nn.Linear(input_dim+64, hidden_dim)        
+            embedding_h = nn.Linear(input_dim, emb_dim//2)       
             encode_h = nn.GRU(emb_dim//2, emb_dim, batch_first=True)
         elif emb_type == 'pos_enc':
             embedding_h = nn.Linear(input_dim, emb_dim)
@@ -214,7 +208,6 @@ class SCOUT_MTP(nn.Module):
         linear_cat = nn.Linear(emb_dim + backbone_feature_dim, hidden_dim)
         self.hidden_dim = hidden_dim
         
-        #self.embedding_e = nn.Linear(2, hidden_dims) if  ew_type else nn.Linear(1, hidden_dims)
         resize_e = nn.ReplicationPad1d(self.hidden_dim//2-1)
         resize_e2 = nn.ReplicationPad1d(self.hidden_dim * heads//2-1)
 
@@ -225,15 +218,13 @@ class SCOUT_MTP(nn.Module):
 
         if heads == 1:
             gat_1 = My_GATLayer(self.hidden_dim, self.hidden_dim, e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection) #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu) 
-            #gat_2 = My_GATLayer(self.hidden_dim, self.hidden_dim,  e_dims = self.hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection)  #GATConv(hidden_dim, hidden_dim, 1,feat_drop, attn_drop,residual=True, activation=torch.relu)
             gat_2 = MultiHeadGATLayer(self.hidden_dim, self.hidden_dim,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='cat', res_connection=res_connection ,num_heads=self.num_modes, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
-            #linear1 = nn.Linear(self.hidden_dim, output_dim * self.num_modes)
+        
         else:
             gat_1 = MultiHeadGATLayer(self.hidden_dim, self.hidden_dim, e_dims=self.hidden_dim//2*2,res_weight=res_weight, merge='cat', res_connection=res_connection , num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) #GATConv(hidden_dim, hidden_dim, heads,feat_drop, attn_drop,residual=True, activation='relu')
-            #self.embedding_e2 = nn.Linear(2, hidden_dims*heads) if ew_type else nn.Linear(1, hidden_dims*heads)
             gat_2 = MultiHeadGATLayer(self.hidden_dim*heads, self.hidden_dim*heads,e_dims=self.hidden_dim*heads//2*2, res_weight=res_weight, merge='cat', res_connection=res_connection ,num_heads=self.num_modes, feat_drop=0., attn_drop=0., att_ew=att_ew) #GATConv(hidden_dim*heads, hidden_dim*heads, heads,feat_drop, attn_drop,residual=True, activation='relu')
         
-        linear1 = nn.Linear(self.hidden_dim * heads * self.num_modes * history_frames, output_dim * self.num_modes) if self.emb_type=='pos_enc' else nn.Linear(self.hidden_dim * heads * self.num_modes, output_dim * self.num_modes) #nn.ModuleList()
+        linear1 = nn.Linear(self.hidden_dim * heads * self.num_modes, 2 * self.num_modes ) if self.emb_type=='pos_enc' else nn.Linear(self.hidden_dim * heads * self.num_modes, output_dim * self.num_modes) #nn.ModuleList()
             
             
         if dropout:
@@ -244,7 +235,7 @@ class SCOUT_MTP(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.1) 
         self.embeddings = nn.ModuleDict({
             'embedding_h': embedding_h,
-            'map_encoder': feature_extractor,
+            #'map_encoder': feature_extractor,
             'linear_cat': linear_cat
         })
         if self.emb_type != 'emb':
@@ -256,20 +247,7 @@ class SCOUT_MTP(nn.Module):
           'resize_e2': resize_e2,
           'gat2': gat_2
         })
-        '''
-        ###############
-        # DECODER_GRU #
-        ###############
-        # OPTION 1  
-        dec_gru = nn.GRUCell(self.hidden_dim * heads * self.num_modes, emb_dim * num_modes)
-        # Once we decode over T frames we output final traj + prob
-        linear1 = nn.Linear(5 * emb_dim * self.num_modes, self.output_dim * self.num_modes ) 
-        # OPTION 2  ,  gat_2 merge=list
-        ##dec_gru = nn.GRUCell(self.hidden_dim * heads, emb_dim)
-        # Once we decode over T frames we output final traj + prob
-        ##linear1 = nn.Linear(5 * emb_dim * self.num_modes, self.output_dim * self.num_modes)  #A) nn.Linear(5 * emb_dim * self.num_modes, self.output_dim) 
-        self.base['dec'] = dec_gru
-        '''
+        
         self.base['linear1'] = linear1
         
         self.reset_parameters()
@@ -282,45 +260,34 @@ class SCOUT_MTP(nn.Module):
         elif self.gn:
             nn.init.constant_(self.group_norm.weight, 1)
             nn.init.constant_(self.group_norm.bias, 0)
-        #nn.init.kaiming_normal_(self.embedding_h[0].weight, nonlinearity='leaky_relu', a=0.2)
         nn.init.kaiming_normal_(self.embeddings['embedding_h'].weight, torch.nn.init.calculate_gain('linear'))
-        ''' 
-        OTRA OPCION
-        fan_in = self.embeddings['embedding_h'].in_features
-        nn.init.normal(self.embeddings['embedding_h'].weight, 0, sqrt(1. / fan_in))
-        '''
         nn.init.kaiming_normal_(self.base['linear1'].weight, nonlinearity='relu')
         nn.init.xavier_normal_(self.embeddings['linear_cat'].weight)       
-        #if self.heads > 1:
-        #    nn.init.xavier_normal_(self.embedding_e2.weight)
     
     def inference(self, g, feats, e_w,snorm_n,snorm_e, maps):
         y=self.forward(g, feats, e_w, snorm_n, snorm_e, maps)
         return y
 
     def forward(self, g, feats,e_w,snorm_n,snorm_e, maps):
-        
         # Input embedding
         if self.emb_type =='gru':
             h_enc = self.embeddings['encode_h'](F.selu(self.embeddings['embedding_h'](feats)))[1].squeeze(dim=0)
         elif self.emb_type == 'pos_enc':
-            h_enc = self.embeddings['encode_h'](F.selu(self.embeddings['embedding_h'](feats)))  # N 7 512
+            h_enc = self.embeddings['encode_h'](F.selu(self.embeddings['embedding_h'](feats)))
         else:
             #reshape to have shape (B*V,T*C) [c1,c2,...,c6]
             feats = feats.contiguous().view(feats.shape[0],-1)
-            h_enc = self.embeddings['embedding_h'](feats)  #[N,hidds]   
-
+            h_enc = self.embeddings['embedding_h'](feats) 
 
         if self.backbone != 'None':
             # Maps feature extraction
-            maps_embedding = self.embeddings['map_encoder'](maps)  
+            maps_embedding = torch.rand(feats.shape[0], 512).to('cuda:0')
             if self.emb_type == 'pos_enc':
                 maps_embedding = maps_embedding.unsqueeze(1).repeat(1,h_enc.shape[1],1)
             # Embeddings concatenation
             h = torch.cat([maps_embedding, h_enc], dim=-1)
             h = self.embeddings['linear_cat'](h)
         
-        #h = F.relu(h)
         if self.bn:
             h = self.batch_norm(h)
             h = F.relu(h)
@@ -329,7 +296,7 @@ class SCOUT_MTP(nn.Module):
 
         # GAT Layers
         if self.ew_dims:
-            e = self.base['resize_e'](torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e(e_w)
+            e = self.base['resize_e'](torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1)
         else:
             e = torch.ones((1, self.hidden_dim), device=h.device) * e_w
         g.edata['w'] = e 
@@ -338,38 +305,22 @@ class SCOUT_MTP(nn.Module):
         
         if self.heads > 1:
             if self.ew_dims:
-                e = self.base['resize_e2'](torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e2(e_w)
+                e = self.base['resize_e2'](torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1)
             else:
                 e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
             g.edata['w'] = e 
         
-        h_modes = self.base['gat2'](g, h, snorm_n)  #BN Y RELU DENTRO DE LA GAT_LAYER
-        '''
-        y = torch.zeros(5, feats.shape[0], self.emb_dim * self.num_modes).float().to(h_modes.device)
-        h = h_enc.repeat(1,self.num_modes)
-        #y = torch.zeros((self.num_modes, 5, feats.shape[0], self.emb_dim), device=h.device)
-        #y_out = torch.zeros((self.num_modes, feats.shape[0], self.output_dim), device=h.device)
-        #for i, mode in enumerate(h_modes):
-        for t in range(5):
-            h = self.base['dec'](h_modes, h)
-            y[t] = h
-        '''
+        h_modes = self.base['gat2'](g, h, snorm_n)  
         y = self.dropout_l(h_modes)
         
+        y = self.base['linear1'](y)
+    
         #y =  self.base['linear1'](h_modes)
         if self.emb_type == 'pos_enc':
             y = y.view(y.shape[0],-1)
-        
-        y = self.base['linear1'](y)
-        
+
         mode_probabilities = torch.cat([y[:, self.output_dim * i - 1].unsqueeze(1) for i in range(1,self.num_modes+1)], dim=1)
         predictions = torch.cat([y[:, self.output_dim * (i-1) : self.output_dim*i - 1]  for i in  range(1,self.num_modes+1)], dim=1)
-        ##mode_probabilities = y_out[:, :, - 1].transpose(0,1)
-        ##predictions = y_out[:,:,:-1].contiguous().view(feats.shape[0],-1)
-
-        # Normalize the probabilities to sum to 1 for inference.
-        ##mode_probabilities = y[:, -self.num_modes:].clone()
-        ##predictions = y[:, :-self.num_modes]
 
         if not self.training:
             mode_probabilities = F.softmax(mode_probabilities, dim=-1)
@@ -381,7 +332,7 @@ if __name__ == '__main__':
 
     history_frames = 7
     future_frames = 5
-    hidden_dims = 256
+    hidden_dims = 768
     heads = 2
     emb_type = 'pos_enc'
 
@@ -400,24 +351,12 @@ if __name__ == '__main__':
     maps = torch.rand(6, 3, 112, 112)
     out = model(g, feats, e_w,snorm_n,snorm_e,  maps)
 
-    desired_shape = (out.shape[0], 3, -1, 2)
-    trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
-
-    off_road = utils.OffRoadRate(helper)
-    
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, challenge_eval=True, collate_fn=collate_batch_test)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch)
 
     for batch in test_dataloader:
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene, tokens,global_feats, mean_xy = batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene = batch
         e_w = batched_graph.edata['w']#.unsqueeze(1)
         out = model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-
-        desired_shape = (out.shape[0], 3, -1, 2)
-        trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape).transpose(0,1)
-        for i, mode in enumerate(trajectories_no_modes):
-            trajectories_no_modes[i] =  convert_local_coords_to_global(mode, global_feats[history_frames-1,:2], global_feats[history_frames-1,2]) + mean_xy
-        off_road_output = off_road(trajectories_no_modes, str(tokens[0][1]))
-
         print(out.shape)

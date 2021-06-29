@@ -13,6 +13,7 @@ from models.MapEncoder import My_MapEncoder
 from models.scout import My_GATLayer, MultiHeadGATLayer
 from torchsummary import summary
 from torch.distributions import Normal
+from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
 
 class MLP_Enc(nn.Module):
     "Encoder: MLP that takes GNN output as input and returns mu and log variance of the latent distribution."
@@ -132,21 +133,15 @@ class VAE_GNN(nn.Module):
             dec_dims = z_dim + hidden_dim*2
         
         elif backbone == 'resnet18':       
-            model_ft = resnet18(pretrained=True)
-            modules = list(model_ft.children())[:-3]
-            modules.append(torch.nn.AdaptiveAvgPool2d((1, 1)))
-            modules.append(torch.nn.Flatten(start_dim=1))
-            modules.append(torch.nn.Linear(256, hidden_dim)) 
-            self.feature_extractor = torch.nn.Sequential(*modules) 
-            ct=0
-            for child in self.feature_extractor.children():
-                ct+=1
-                if ct < freeze:  #freeze 2 BasicBlocks , train last one 128 -> 256
-                    for param in child.parameters():
-                        param.requires_grad = False
+            #self.feature_extractor = ResNet18(hidden_dim, freeze)
+            self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #[n, 512] #9 layers (con avgpool) - if freeze=8 train last conv block
             
-            enc_dims = 2*hidden_dim + (output_dim-1) 
-            dec_dims = 2*hidden_dim + z_dim 
+            enc_dims = 512 + hidden_dim + (output_dim-1)  #2*hidden_dim + (output_dim-1) 
+            dec_dims = z_dim + hidden_dim + 512 #hidden_dim*2
+        elif backbone == 'resnet50':       
+            self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048]   #self.feature_extractor = ResNet50(hidden_dim, freeze)
+            enc_dims = 2048 + hidden_dim + (output_dim-1)
+            dec_dims = z_dim + hidden_dim + 2048
         
         elif backbone == 'resnet_gray':
             resnet = resnet18(pretrained=False)
@@ -173,14 +168,14 @@ class VAE_GNN(nn.Module):
         #  ENCODER  #
         #############
         self.GNN_enc = GAT_VAE(enc_dims,layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
-        encoder_dims = enc_dims*heads
+        encoder_dims = enc_dims
         self.MLP_encoder = MLP_Enc(encoder_dims+(output_dim-1), z_dim, dropout=dropout)
 
         #############
         #  DECODER  #
         ############# 
         self.GNN_decoder = GAT_VAE(dec_dims, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=False, ew_dims=ew_dims) #If att_ew --> embedding_e_dec
-        self.MLP_decoder = MLP_Dec(dec_dims*heads+z_dim, dec_dims, output_dim, dropout)
+        self.MLP_decoder = MLP_Dec(dec_dims+z_dim, dec_dims, output_dim, dropout)
 
         self.base = nn.ModuleList([
             self.GNN_enc,
@@ -310,18 +305,18 @@ class VAE_GNN(nn.Module):
         return recon_y[:,:-1], recon_y[:,-1],  [mu, log_var], z_sample
 
 if __name__ == '__main__':
-    history_frames = 5
-    future_frames = 12
+    history_frames = 7
+    future_frames = 10
     hidden_dims = 100
     heads = 2
 
-    input_dim = 6*history_frames
-    output_dim = 2*future_frames 
+    input_dim = 7*history_frames
+    output_dim = 2*future_frames +1
 
     hidden_dims = round(hidden_dims / heads) 
-    model = VAE_GNN(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet')
+    model = VAE_GNN(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet18')
     #summary(model.feature_extractor, (1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=True, history_frames=history_frames, future_frames=future_frames) 
+    test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
     test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_batch)
 
     for batch in test_dataloader:

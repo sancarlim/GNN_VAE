@@ -14,6 +14,7 @@ from nuscenes.utils.splits import create_splits_scenes
 import pandas as pd
 from collections import defaultdict
 from pyquaternion import Quaternion
+from nuscenes.eval.common.utils import quaternion_yaw, angle_diff
 from torchvision import transforms
 
 from nuscenes.prediction.input_representation.static_layers import StaticLayerRasterizer
@@ -25,13 +26,13 @@ from nuscenes.prediction.input_representation.combinators import Rasterizer
 #508 0 sequences???
 scene_blacklist = [992]
 
-max_num_objects = 50  #pkl np.arrays with same dimensions
+max_num_objects = 70  #pkl np.arrays with same dimensions
 total_feature_dimension = 16 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
-history = 2
-future = 6
+history = 3
+future = 5
 history_frames = history*FREQUENCY 
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames + 1 #2s of history + 6s of prediction
@@ -42,7 +43,7 @@ nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
 # Helper for querying past and future data for an agent.
 helper = PredictHelper(nuscenes)
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
-base_path_map = os.path.join(base_path, 'hd_maps_ego')
+base_path_map = os.path.join(base_path, 'hd_maps_3s')
 
 static_layer_rasterizer = StaticLayerRasterizer(helper)
 agent_rasterizer = AgentBoxesWithFadedHistory(helper, seconds_of_history=2)
@@ -302,7 +303,8 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
 
     
     object_feature_list = np.array(object_feature_list)  # T,V,C
-    assert object_feature_list.shape[1] < max_num_objects
+    if object_feature_list.shape[1] > 50:
+        print(object_feature_list.shape[1])
     assert object_feature_list.shape[0] == total_frames
     object_frame_feature = np.zeros((max_num_objects, total_frames, total_feature_dimension))  # V, T, C
     object_frame_feature[:num_visible_object] = np.transpose(object_feature_list, (1,0,2))
@@ -353,9 +355,9 @@ def process_scene(scene):
             
             if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
                 node_type = 2
-            elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute:
+            elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute and 'parked' not in attribute and 'stopped' not in attribute:
                 node_type = 3
-            if 'vehicle' in category and 'parked' not in attribute and 'stopped' not in attribute:                 
+            elif 'vehicle' in category and 'parked' not in attribute and 'stopped' not in attribute:                 
                 node_type = 1
             else:
                 continue
@@ -461,9 +463,8 @@ def process_scene(scene):
         start_ind = current_ind - history_frames
         end_ind = current_ind + future_frames
         object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind)  
-        
-        #HD MAPs
         '''
+        #HD MAPs
         # Retrieve ego_vehicle pose
         sample_token = tracks[current_ind]['sample_token'][0]
         sample_record = nuscenes.get('sample', sample_token)     
@@ -505,7 +506,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 
 
 #scenes_df=[]
-for data_class in ['train','val','test']:
+for data_class in ['train']:
     scenes_token_set=set()
     for ann in ns_scene_names[data_class]:
         _, sample_token=ann.split("_")

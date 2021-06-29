@@ -35,7 +35,7 @@ total_frames = history_frames + future_frames #2s of history + 6s of prediction
 input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 + 1
 base_path = '/home/sandra/PROGRAMAS/DBU_Graph/NuScenes'
-NUM_MODES = 8
+NUM_MODES = 5
 
 DATAROOT = '/media/14TBDISK/nuscenes'
 nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
@@ -45,7 +45,7 @@ helper = PredictHelper(nuscenes)
 class LitGNN(pl.LightningModule):
     def __init__(self, model,  train_dataset, val_dataset, test_dataset, model_type, history_frames: int=3, future_frames: int=3, 
                  lr: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1.,
-                 rel_types: bool = False, scale_factor=1):
+                 rel_types: bool = False, scale_factor=1, ckpt: str = None):
         super().__init__()
         self.model= model
         self.history_frames =history_frames
@@ -55,6 +55,7 @@ class LitGNN(pl.LightningModule):
         self.rel_types = rel_types
         self.scale_factor = scale_factor
         self.model_type = model_type
+        self.ckpt = ckpt
         self.challenge_predictions = []
         f = open('/media/14TBDISK/nuscenes/maps/prediction/prediction_scenes.json')
         self.prediction_scenes = json.load(f)  #Dict with keys "scene_id" : list("instances_samples")
@@ -177,7 +178,8 @@ class LitGNN(pl.LightningModule):
                         self.challenge_predictions.append(pred.serialize())
             
     def test_epoch_end(self, outputs):
-        json.dump(self.challenge_predictions, open(os.path.join(base_path, 'challenge_inference_balmy.json'),'w'))
+        name = self.ckpt.split('/')[5].split('-')[0]
+        json.dump(self.challenge_predictions, open(os.path.join(base_path, name + '_challenge_inference.json'),'w'))
 
    
 def main(args: Namespace):
@@ -207,11 +209,11 @@ def main(args: Namespace):
     LitGNN_sys = LitGNN(model=model, history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
                  test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, model_type = args.model_type)
       
-    trainer = pl.Trainer(gpus=args.gpus, deterministic=True, precision=16, profiler=True) 
+    trainer = pl.Trainer(gpus=args.gpus, deterministic=True, precision=16) 
  
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
                     train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor,
-                    model_type = args.model_type)
+                    model_type = args.model_type, ckpt = args.ckpt)
 
     
     trainer.test(LitGNN_sys)
@@ -224,7 +226,7 @@ if __name__ == '__main__':
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
     parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=2048)
+    parser.add_argument("--hidden_dims", type=int, default=512)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'vae_prior','scout', 'mtp'])
     parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
@@ -232,7 +234,7 @@ if __name__ == '__main__':
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--feat_drop", type=float, default=0.)
     parser.add_argument("--attn_drop", type=float, default=0.4)
-    parser.add_argument("--heads", type=int, default=2, help='Attention heads (GAT)')
+    parser.add_argument("--heads", type=int, default=1, help='Attention heads (GAT)')
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')

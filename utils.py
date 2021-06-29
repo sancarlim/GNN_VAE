@@ -1,19 +1,16 @@
 import argparse
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import math
 import random
-
 from torch.nn import functional as f
-
-import sys
-sys.path.append('/home/sandra/PROGRAMAS/nuscenes-devkit/python-sdk/')
-import nuscenes 
-from nuscenes.eval.common.utils import quaternion_yaw, angle_diff
+from nuscenes.eval.common.utils import quaternion_yaw
 from pyquaternion import Quaternion
+from nuscenes.map_expansion.map_api import NuScenesMap
+from nuscenes.prediction import PredictHelper
+from nuscenes.prediction.input_representation.static_layers import load_all_maps
+from scipy import interpolate
 
 
 class MTPLoss:
@@ -120,7 +117,8 @@ class MTPLoss:
 
     def _compute_best_mode(self,
                            angles_from_ground_truth: List[Tuple[float, int]],
-                           target: torch.Tensor, trajectories: torch.Tensor) -> int:
+                           target: torch.Tensor, trajectories: torch.Tensor,
+                           mask: torch.Tensor) -> int:
         """
         Finds the index of the best mode given the angles from the ground truth.
         :param angles_from_ground_truth: List of (angle, mode index) tuples.
@@ -152,7 +150,7 @@ class MTPLoss:
             distances_from_ground_truth = []
 
             for angle, mode in angles_from_ground_truth[:max_angle_below_thresh_idx + 1]:
-                norm = self._compute_ave_l2_norms(target - trajectories[mode, :, :])
+                norm = self._compute_ave_l2_norms(target - trajectories[mode, :, :], mask)
 
                 distances_from_ground_truth.append((norm, mode))
 
@@ -192,18 +190,22 @@ class MTPLoss:
         targets = targets * mask
 
         for batch_idx in range(targets.shape[0]): #-1 to not take into account ego
-
-            #angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
-            #                                                trajectories=trajectories[batch_idx])
-
-            #best_mode = self._compute_best_mode(angles,
-            #                                    target=targets[batch_idx],
-            #                                    trajectories=trajectories[batch_idx])
             
             if not mask[batch_idx].squeeze().any():
                 best_trajs = torch.cat((best_trajs, trajectories[batch_idx, 0, :].unsqueeze(0)), 0)
                 continue
+            
+            '''
+            angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
+                                                            trajectories=trajectories[batch_idx])
 
+            
+            best_mode = self._compute_best_mode(angles,
+                                                target=targets[batch_idx],
+                                                trajectories=trajectories[batch_idx],
+                                                mask=mask[batch_idx].squeeze())
+
+            '''
             distances_from_ground_truth = []
             for mode in range(self.num_modes):
                 norm = self._compute_ave_l2_norms(targets[batch_idx] - trajectories[batch_idx][mode, :, :], mask[batch_idx].squeeze())
@@ -212,7 +214,7 @@ class MTPLoss:
 
             distances_from_ground_truth = sorted(distances_from_ground_truth)
             best_mode = distances_from_ground_truth[0][1]
-
+            
 
             best_mode_trajectory = trajectories[batch_idx, best_mode, :].unsqueeze(0)
             
@@ -278,8 +280,7 @@ def compute_change_pos(feats,gt, local_frame):
     gt_vel[:, 1:] = (gt_vel[:, 1:] - gt_vel[:, :-1]) * new_mask_gt
 
     if not local_frame:
-        # Global feats scaled by 5
-        feats_vel *= 5
+        #feats_vel *= 5
         gt_vel[:, :1] = (gt_vel[:, :1] - feats_vel[:, -1:]) 
 
     feats_vel[:, 1:] = (feats_vel[:, 1:] - feats_vel[:, :-1]) * new_mask_feats
@@ -287,42 +288,13 @@ def compute_change_pos(feats,gt, local_frame):
 
     return feats_vel, gt_vel
 
-def plot_grad_flow(named_parameters):
-    '''Plots the gradients flowing through different layers in the net during training.
-    Can be used for checking for possible gradient vanishing / exploding problems.
-    
-    Usage: Plug this function in Trainer class after loss.backwards() as 
-    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
-    ave_grads = []
-    max_grads= []
-    layers = []
-    for n, p in named_parameters():
-        if(p.requires_grad) and ("bias" not in n) and p.grad is not None:
-            layers.append(n)
-            ave_grads.append(p.grad.abs().mean().cpu().numpy())
-            max_grads.append(p.grad.abs().max().cpu().numpy())
-    if len(max_grads) != 0:
-        plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
-        plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
-        plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )
-        plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")
-        plt.xlim(left=0, right=len(ave_grads))
-        plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions
-        plt.xlabel("Layers")
-        plt.ylabel("average gradient")
-        plt.title("Gradient flow")
-        plt.grid(True)
-        plt.legend([Line2D([0], [0], color="c", lw=4),
-                    Line2D([0], [0], color="b", lw=4),
-                    Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
-        plt.savefig('foo.png')
 
 def compute_long_lat_error(pred,gt,mask):
     pred = pred*mask #B*V,T,C  (B n grafos en el batch)
     gt = gt*mask  # outputmask BV,T,C
     lateral_error = pred[:,:,0]-gt[:,:,0]
-    long_error = pred[:,:,1] - gt[:,:,1]  #BV,T
-    overall_num = mask.sum(dim=-1).type(torch.int)  #torch.Tensor[(BV,T)] - num de agentes (Y CON DATOS) en cada frame
+    long_error = pred[:,:,1] - gt[:,:,1]  
+    overall_num = mask.sum(dim=-1).type(torch.int) 
     return lateral_error, long_error, overall_num
 
 
@@ -363,7 +335,7 @@ def convert_global_coords_to_local(coordinates: np.ndarray,
     transform = make_2d_rotation_matrix(angle_in_radians=yaw)
 
     coords = (coordinates - np.atleast_2d(np.array(translation)[:2])).T
-    new_coords = np.zeros((5, 2))
+    new_coords = np.zeros((7, 2))
     transformed = np.dot(transform, coords).T[:, :2]
     if history:
         for i in range(len(transformed)):
@@ -388,3 +360,92 @@ def convert_local_coords_to_global(coordinates: np.ndarray,
     transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
 
     return np.dot(transform, coordinates.T).T[:, :2] + np.atleast_2d(np.array(translation)[:2])
+
+
+class OffRoadRate:
+
+    def __init__(self, helper: PredictHelper):
+        """
+        The OffRoadRate is defined as the fraction of trajectories that are not entirely contained
+        in the drivable area of the map.
+        :param helper: Instance of PredictHelper. Used to determine the map version for each prediction.
+        """
+        self.helper = helper
+        self.drivable_area_polygons = self.load_drivable_area_masks(helper)
+        self.pixels_per_meter = 10
+        self.number_of_points = 200
+
+    @staticmethod
+    def load_drivable_area_masks(helper: PredictHelper) -> Dict[str, np.ndarray]:
+        """
+        Loads the polygon representation of the drivable area for each map.
+        :param helper: Instance of PredictHelper.
+        :return: Mapping from map_name to drivable area polygon.
+        """
+
+        maps: Dict[str, NuScenesMap] = load_all_maps(helper)
+
+        masks = {}
+        for map_name, map_api in maps.items():
+
+            masks[map_name] = map_api.get_map_mask(patch_box=None, patch_angle=0, layer_names=['drivable_area'],
+                                                   canvas_size=None)[0]
+
+        return masks
+
+    @staticmethod
+    def interpolate_path(mode: np.ndarray, number_of_points: int) -> Tuple[np.ndarray, np.ndarray]:
+        """ Interpolate trajectory with a cubic spline if there are enough points. """
+
+        # interpolate.splprep needs unique points.
+        # We use a loop as opposed to np.unique because
+        # the order of the points must be the same
+        seen = set()
+        ordered_array = []
+        for row in mode:
+            row_tuple = tuple(row)
+            if row_tuple not in seen:
+                seen.add(row_tuple)
+                ordered_array.append(row_tuple)
+
+        new_array = np.array(ordered_array)
+
+        unique_points = np.atleast_2d(new_array)
+
+        if unique_points.shape[0] <= 3:
+            return unique_points[:, 0], unique_points[:, 1]
+        else:
+            knots, _ = interpolate.splprep([unique_points[:, 0], unique_points[:, 1]], k=3, s=0.1)
+            x_interpolated, y_interpolated = interpolate.splev(np.linspace(0, 1, number_of_points), knots)
+            return x_interpolated, y_interpolated
+
+    def __call__(self, prediction: np.ndarray, sample_token: str) -> np.ndarray:
+        """
+        Computes the fraction of modes in prediction that are not entirely contained in the drivable area.
+        :param prediction: Model prediction.
+        :return: Array of shape (1, ) containing the fraction of modes that are not entirely contained in the
+            drivable area.
+        """
+        map_name = self.helper.get_map_name_from_sample_token(sample_token)
+        drivable_area = self.drivable_area_polygons[map_name]
+        max_row, max_col = drivable_area.shape
+
+        n_violations = 0
+        for mode in prediction:
+
+            # Fit a cubic spline to the trajectory and interpolate with 200 points
+            #x_interpolated, y_interpolated = self.interpolate_path(mode, self.number_of_points)
+
+            # x coordinate -> col, y coordinate -> row
+            # Mask has already been flipped over y-axis
+            index_row = (y_interpolated * self.pixels_per_meter).astype("int")
+            index_col = (x_interpolated * self.pixels_per_meter).astype("int")
+
+            row_out_of_bounds = np.any(index_row >= max_row) or np.any(index_row < 0)
+            col_out_of_bounds = np.any(index_col >= max_col) or np.any(index_col < 0)
+            out_of_bounds = row_out_of_bounds or col_out_of_bounds
+            
+            if out_of_bounds or not np.all(drivable_area[index_row, index_col]):
+                n_violations += 1
+
+        return n_violations / prediction.shape[1]
