@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 from torch.utils.data import DataLoader
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch, collate_batch_test
 from torchvision.models import resnet18
 from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
@@ -17,9 +17,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.prediction import PredictHelper
 
 
-DATAROOT = '/media/14TBDISK/nuscenes'
-nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
-helper = PredictHelper(nuscenes)
+
 
 class PositionalEncoding(nn.Module):
 
@@ -77,8 +75,7 @@ class My_GATLayer(nn.Module):
            concat_z = torch.cat([edges.src['z'], edges.dst['z'], edges.data['w']], dim=-1) 
         
         src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
-        src_e = self.leaky_relu(src_e)
-        return {'e': src_e}
+        return {'e': self.leaky_relu(src_e)}
     
     def message_func(self, edges):
         return {'z': edges.src['z'], 'e':edges.data['e']}
@@ -86,7 +83,7 @@ class My_GATLayer(nn.Module):
     def reduce_func(self, nodes):
         h_s = nodes.data['h_s']      
         #Attention score
-        a = self.attn_drop_l(   F.softmax(nodes.mailbox['e'], dim=-1)  )  #attention score between nodes i and j
+        a = self.attn_drop_l(   F.softmax(nodes.mailbox['e'], dim=1)  )  #attention score between nodes i and j
         h = h_s + torch.sum(a * nodes.mailbox['z'], dim=1)
         return {'h': h}
                                
@@ -382,8 +379,8 @@ if __name__ == '__main__':
     history_frames = 7
     future_frames = 5
     hidden_dims = 256
-    heads = 2
-    emb_type = 'pos_enc'
+    heads = 1
+    emb_type = 'emb'
 
     input_dim = 7 if emb_type != 'emb' else 7*(history_frames)
     output_dim = 2*future_frames + 1
@@ -391,33 +388,35 @@ if __name__ == '__main__':
     model = SCOUT_MTP(input_dim=input_dim, hidden_dim=hidden_dims, emb_dim=512, emb_type=emb_type, output_dim=output_dim, heads=heads,  ew_dims= True,
                    dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=False, backbone='resnet50', freeze=True)
     
-    
-    g = dgl.graph(([0, 0, 0, 0, 0, 0], [0, 1, 2, 3, 4, 5]))
-    e_w = torch.rand(6, 2)
-    snorm_n = torch.rand(6, 1)
-    snorm_e = torch.rand(6, 1)
-    feats = torch.rand(6, history_frames, 7)
-    maps = torch.rand(6, 3, 112, 112)
+    #DATAROOT = '/media/14TBDISK/nuscenes'
+    #nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
+    #helper = PredictHelper(nuscenes)
+    g = dgl.graph(([0, 0, 0, 1, 2, 1, 1], [0, 1, 2, 0, 1, 2, 0]))
+    e_w = torch.rand(7, 2)
+    snorm_n = torch.rand(3, 1)
+    snorm_e = torch.rand(3, 1)
+    feats = torch.rand(3, history_frames, 7)
+    maps = torch.rand(3, 3, 112, 112)
     out = model(g, feats, e_w,snorm_n,snorm_e,  maps)
 
     desired_shape = (out.shape[0], 3, -1, 2)
     trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
 
-    off_road = utils.OffRoadRate(helper)
+    #off_road = utils.OffRoadRate(helper)
     
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, challenge_eval=True, collate_fn=collate_batch_test)
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, challenge_eval=True, local_frame=False) 
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_test)
 
     for batch in test_dataloader:
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene, tokens,global_feats, mean_xy = batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens,  scene, mean_xy, maps ,global_feats = batch
         e_w = batched_graph.edata['w']#.unsqueeze(1)
         out = model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
-
+        '''
         desired_shape = (out.shape[0], 3, -1, 2)
         trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape).transpose(0,1)
         for i, mode in enumerate(trajectories_no_modes):
             trajectories_no_modes[i] =  convert_local_coords_to_global(mode, global_feats[history_frames-1,:2], global_feats[history_frames-1,2]) + mean_xy
         off_road_output = off_road(trajectories_no_modes, str(tokens[0][1]))
-
+        '''
         print(out.shape)
