@@ -1,4 +1,4 @@
-from discriminator import Discriminator
+from models.discriminator import Discriminator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,8 +12,120 @@ from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
 from models.VAE_GNN import GAT_VAE
 from torchsummary import summary
-import efemarai as ef
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
+import dgl
+import dgl.function as fn
+from dgl.nn.pytorch.conv.gatconv import edge_softmax, Identity, expand_as_pair
+
+
+class Joint_Latent_opt(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 num_heads=1,
+                 attn_drop=0.6,
+                 negative_slope=0.2,
+                 residual=False,
+                 activation=F.elu):
+        super(Joint_Latent_opt, self).__init__()
+        self._num_heads = 1
+        self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
+        self._out_feats = in_feats
+        self.attn_l = nn.Parameter(torch.FloatTensor(size=(1, num_heads, in_feats)))
+        self.attn_r = nn.Parameter(torch.FloatTensor(size=(1, num_heads, in_feats)))
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+        if residual:
+            self.res_fc = Identity()
+        else:
+            self.register_buffer('res_fc', None)
+        self.reset_parameters()
+        self.activation = activation
+
+    def reset_parameters(self):
+        """
+        Description
+        -----------
+        Reinitialize learnable parameters.
+        Note
+        ----
+        The fc weights are initialized using Glorot uniform initialization.
+        The attention weights are using xavier initialization method.
+        """
+        gain = nn.init.calculate_gain('relu')
+        if hasattr(self, 'fc'):
+            nn.init.xavier_normal_(self.fc.weight, gain=gain)
+            nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
+        nn.init.xavier_normal_(self.attn_l, gain=gain)
+        nn.init.xavier_normal_(self.attn_r, gain=gain)
+
+    def forward(self, graph, z, get_attention=False):
+        with graph.local_scope():
+            h_src = h_dst = z
+            feat_src = feat_dst = h_src.view(-1, self._num_heads, self._out_feats)
+            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)   # AÑADIR AQUÍ FEATS E_W
+            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
+            graph.srcdata.update({'ft': feat_src, 'el': el})
+            graph.dstdata.update({'er': er})
+            # compute edge attention, el and er are a_l z_i and a_r z_j respectively.
+            graph.apply_edges(fn.u_add_v('el', 'er', 'e'))
+            e = self.leaky_relu(graph.edata.pop('e'))
+            # compute softmax
+            graph.edata['a'] = self.attn_drop(edge_softmax(graph, e))
+            # message passing
+            graph.update_all(fn.u_mul_e('ft', 'a', 'm'),
+                             fn.sum('m', 'ft'))
+            rst = graph.dstdata['ft']# residual
+            if self.res_fc is not None:
+                resval = self.res_fc(h_dst).view(h_dst.shape[0], -1, self._out_feats)
+                rst = rst + resval
+            # activation
+            if self.activation:
+                rst = self.activation(rst)
+            if self._num_heads == 1:
+                rst = rst.squeeze(1)
+            if get_attention:
+                return rst, graph.edata['a']
+            else:
+                return rst
+
+
+class Joint_Latent(nn.Module):
+    def __init__(self, z_dim, attn_drop):
+        super(Joint_Latent, self).__init__()
+        self.attention_func = nn.Linear(2 * z_dim, 1, bias=False)
+        self.attn_drop_l = nn.Dropout(attn_drop)
+        self.reset_parameters()
+      
+    def reset_parameters(self):
+        """Reinitialize learnable parameters."""
+        #nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='relu')
+        #nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.attention_func.weight, a=0.2, nonlinearity='leaky_relu')
+        
+    def edge_attention(self, edges):
+        concat_z = torch.cat([edges.src['latent'], edges.dst['latent']], dim=-1) #(n_edg,hid)||(n_edg,hid) -> (n_edg,2*hid) 
+        src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
+        src_e = F.selu(src_e)
+        return {'e': src_e}
+    
+    def message_func(self, edges):
+        return {'latent': edges.src['latent'], 'e':edges.data['e']}
+        
+    def reduce_func(self, nodes): 
+        #Attention score
+        a = self.attn_drop_l(   F.softmax(nodes.mailbox['e'], dim=1)  )  #attention score between nodes i and j
+        z = torch.sum(a * nodes.mailbox['latent'], dim=1)  # + z_in ?  #z_i * z_ij
+        return {'latent': z}
+                               
+    def forward(self, g, z):
+        with g.local_scope():
+            z_in = z.clone()
+            g.ndata['latent'] = z 
+            g.apply_edges(self.edge_attention)
+            g.update_all(self.message_func, self.reduce_func)
+            z = g.ndata['latent'] #+g.ndata['h_s'] 
+               
+            return z  
 
 
 class MLP_Enc(nn.Module):
@@ -142,7 +254,6 @@ class VAE_GNN_prior(nn.Module):
         GNN_prior = GAT_VAE(enc_dims-(output_dim-1),layers=2, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims)
         encoder_dims = (enc_dims-(output_dim-1))#*heads
         MLP_prior = MLP_Enc(encoder_dims, z_dim, dropout=dropout)
-        
 
         #############
         #  DECODER  #
@@ -160,6 +271,8 @@ class VAE_GNN_prior(nn.Module):
             'GNN_decoder':  GNN_decoder,
             'MLP_decoder':  MLP_decoder
         })
+        joint_latent = Joint_Latent_opt(z_dim, attn_drop = attn_drop)
+        self.base['joint_latent'] = joint_latent
 
         if self.bn:
             self.bn_enc = nn.BatchNorm1d(enc_dims) 
@@ -277,7 +390,7 @@ class VAE_GNN_prior(nn.Module):
         #### DECODE ####      
         pred = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
 
-        return pred[:,:-1], pred[:,-1], [mu_prior, log_var_prior], z_sample
+        return pred[:,:-1], pred[:,-1], [mu_prior, log_var_prior]
 
  
     def forward(self, g, features, e_w, snorm_n, snorm_e, labels, maps):
@@ -302,16 +415,16 @@ class VAE_GNN_prior(nn.Module):
         #### PRIOR ####
         mu_prior, log_var_prior = self.prior(g, h_emb, e_w, snorm_n, maps_emb)
 
-        #### DECODE #### 
-        
+        #### DECODE ####         
         pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
         for _ in range(self.num_modes):
             #### Sample from the latent distribution ###
-            z_sample = self.reparameterize(mu, log_var)
+            z_sample = self.reparameterize(mu_prior, log_var_prior)
+            z_sample = self.base['joint_latent'](g, z_sample)
             pred.append( self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample) )#torch.cat( ,  dim = 0) # 3, N, 25
         
         pred = torch.stack(pred,dim=0)
-        return pred[:,:,:-1], pred[:,:,-1], [mu, log_var, mu_prior, log_var_prior], z_sample
+        return pred[:,:,:-1], pred[:,:,-1], [mu, log_var, mu_prior, log_var_prior]
         '''
         z_sample = self.reparameterize(mu_prior, log_var_prior)
         pred = self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample)
@@ -324,24 +437,35 @@ if __name__ == '__main__':
     future_frames = 10
     hidden_dims = 128
     heads = 2
+    emb_type = 'emb'
 
-    input_dim = 7
+    input_dim = 7 if emb_type != 'emb' else 7*(history_frames)
     output_dim = 2*future_frames + 1
 
     model = VAE_GNN_prior(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., 
-                    heads=2,att_ew=True, ew_dims=2, backbone='resnet18', encoding_type='pos_enc')
+                    heads=heads,att_ew=True, ew_dims=2, backbone='resnet18', encoding_type=emb_type)
+
+    g = dgl.graph(([0, 0, 0, 1, 2, 1, 1], [0, 1, 2, 0, 1, 2, 0]))
+    e_w = torch.rand(7, 2)
+    snorm_n = torch.rand(3, 1)
+    snorm_e = torch.rand(3, 1)
+    feats = torch.rand(3, history_frames, 7)
+    gt = torch.rand(3, future_frames, 2)
+    maps = torch.rand(3, 3, 112, 112)
+    out = model(g, feats, e_w,snorm_n,snorm_e, gt, maps)
+
     #summary(model.feature_extractor, input_size=(3,224,224), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
     test_dataloader = DataLoader(test_dataset, batch_size=3, shuffle=False, collate_fn=collate_batch)
 
 
     for batch in test_dataloader:
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene = batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene, tokens = batch
         e_w = batched_graph.edata['w']
         #e_w= e_w.unsqueeze(1)
         #y = model.inference(batched_graph, feats, e_w,snorm_n,snorm_e, maps)
         
-        y, prob,_,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
+        y, prob,_ = model(batched_graph, feats, e_w,snorm_n,snorm_e, labels_pos[:,:,:2],  maps)
         print(y.shape)
 
     

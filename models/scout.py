@@ -25,11 +25,11 @@ class GATConv(nn.Module):
                  in_feats,
                  out_feats,
                  num_heads,
-                 feat_drop=0.,
-                 attn_drop=0.,
+                 feat_drop=0.6,
+                 attn_drop=0.6,
                  negative_slope=0.2,
                  residual=False,
-                 activation=None):
+                 activation=F.elu):
         super(GATConv, self).__init__()
         self._num_heads = num_heads
         self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
@@ -57,7 +57,7 @@ class GATConv(nn.Module):
         Reinitialize learnable parameters.
         Note
         ----
-        The fc weights :math:`W^{(l)}` are initialized using Glorot uniform initialization.
+        The fc weights are initialized using Glorot uniform initialization.
         The attention weights are using xavier initialization method.
         """
         gain = nn.init.calculate_gain('relu')
@@ -97,7 +97,7 @@ class GATConv(nn.Module):
             # save [Wh_i || Wh_j] on edges, which is not memory-efficient. Plus,
             # addition could be optimized with DGL's built-in function u_add_v,
             # which further speeds up computation and saves memory footprint.
-            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
+            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)   # AÑADIR AQUÍ FEATS E_W
             er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
             graph.srcdata.update({'ft': feat_src, 'el': el})
             graph.dstdata.update({'er': er})
@@ -117,7 +117,8 @@ class GATConv(nn.Module):
             # activation
             if self.activation:
                 rst = self.activation(rst)
-
+            if self._num_heads == 1:
+                rst = rst.squeeze(1)
             if get_attention:
                 return rst, graph.edata['a']
             else:
@@ -138,13 +139,20 @@ class My_GATLayer(nn.Module):
         self.feat_drop_l = nn.Dropout(feat_drop)
         self.attn_drop_l = nn.Dropout(attn_drop)   
         self.res_con = res_connection
+        self.leaky_relu = nn.LeakyReLU(0.2)
         self.reset_parameters()
       
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
-        #nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='relu')
-        #nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='relu')
-        nn.init.kaiming_normal_(self.attention_func.weight, a=0.02, nonlinearity='leaky_relu')
+        #SELF NORMALIZING NN
+        nn.init.kaiming_normal_(self.linear_self.weight, nonlinearity='selu')
+        nn.init.kaiming_normal_(self.linear_func.weight, nonlinearity='selu')
+        '''
+        gain = torch.nn.init.calculate_gain('relu', param=None)  #dgl
+        nn.init.xavier_normal_(self.linear_self.weight, gain) #dgl 
+        nn.init.xavier_normal_(self.linear_func.weight, gain)
+        '''
+        nn.init.kaiming_normal_(self.attention_func.weight, a=0.2, nonlinearity='leaky_relu')
         
     
     def edge_attention(self, edges):
@@ -154,7 +162,7 @@ class My_GATLayer(nn.Module):
            concat_z = torch.cat([edges.src['z'], edges.dst['z'], edges.data['w']], dim=-1) 
         
         src_e = self.attention_func(concat_z)  #(n_edg, 1) att logit
-        src_e = F.selu(src_e)
+        src_e = self.leaky_relu(src_e)
         return {'e': src_e}
     
     def message_func(self, edges):
@@ -167,7 +175,7 @@ class My_GATLayer(nn.Module):
         h = h_s + torch.sum(a * nodes.mailbox['z'], dim=1)
         return {'h': h}
                                
-    def forward(self, g, h,snorm_n):
+    def forward(self, g, h):
         with g.local_scope():
             h_in = h.clone()
             g.ndata['h']  = h 
@@ -191,14 +199,15 @@ class MultiHeadGATLayer(nn.Module):
         super(MultiHeadGATLayer, self).__init__()
         self.heads = nn.ModuleList()
         for i in range(num_heads):
-            self.heads.append(My_GATLayer(in_feats, out_feats, e_dims, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection))
+            self.heads.append( GATConv(in_feats, out_feats, 1, feat_drop, attn_drop, residual=True, activation=F.elu) )
+            #self.heads.append(My_GATLayer(in_feats, out_feats, e_dims, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection))
         self.merge = merge
 
-    def forward(self, g, h, snorm_n):
+    def forward(self, g, h):
         if isinstance(h, list):
-            head_outs = [attn_head(g, h_mode,snorm_n) for attn_head, h_mode in zip(self.heads, h)]
+            head_outs = [attn_head(g, h_mode) for attn_head, h_mode in zip(self.heads, h)]
         else:
-            head_outs = [attn_head(g, h,snorm_n) for attn_head in self.heads]
+            head_outs = [attn_head(g, h) for attn_head in self.heads]
             
         if self.merge == 'cat':
             # concat on the output feature dimension (dim=1), for intermediate layers

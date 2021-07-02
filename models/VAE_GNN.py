@@ -10,7 +10,7 @@ from torchvision.models import resnet18
 from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
 from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder
-from models.scout import My_GATLayer, MultiHeadGATLayer
+from models.scout import My_GATLayer, MultiHeadGATLayer, GATConv
 from torchsummary import summary
 from torch.distributions import Normal
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
@@ -74,9 +74,11 @@ class GAT_VAE(nn.Module):
         if ew_dims > 1:
             self.resize_e = nn.ReplicationPad1d(hidden_dim//2-1)
         if heads == 1:
-            self.gat_1 = My_GATLayer(hidden_dim, hidden_dim, feat_drop, attn_drop,att_ew) 
+            self.gat_1 = GATConv(hidden_dim, hidden_dim, 1, feat_drop, attn_drop, residual=True, activation=F.elu)  
+            #self.gat_1 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2 ,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
             if layers>1:
-                self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, feat_drop, attn_drop,att_ew ) 
+                self.gat_2 = GATConv(hidden_dim, hidden_dim, 1, feat_drop, attn_drop, residual=True, activation=F.elu) 
+                #self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
         else:
             self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim,  e_dims=hidden_dim//2*2 , res_weight=True, res_connection=True, merge='avg', num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew)            
             if layers>1:    
@@ -99,7 +101,7 @@ class GAT_VAE(nn.Module):
         else:
             e = torch.ones((1, self.hidden_dim), device=h.device) * e_w
         g.edata['w']=e
-        h = self.gat_1(g, h,snorm_n) 
+        h = self.gat_1(g, h) 
         if self.layers > 1:
             if self.heads > 1:
                 if self.ew_dims > 1:
@@ -107,7 +109,7 @@ class GAT_VAE(nn.Module):
                 else:
                     e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
                 g.edata['w']=e
-            h = self.gat_2(g, h, snorm_n) 
+            h = self.gat_2(g, h) 
         return h
 
 
@@ -308,13 +310,13 @@ if __name__ == '__main__':
     history_frames = 7
     future_frames = 10
     hidden_dims = 100
-    heads = 2
+    heads = 1
 
     input_dim = 7*history_frames
     output_dim = 2*future_frames +1
 
     hidden_dims = round(hidden_dims / heads) 
-    model = VAE_GNN(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=2,att_ew=True, ew_dims=2, backbone='resnet18')
+    model = VAE_GNN(input_dim, hidden_dims, 25, output_dim, bn=False,fc=False, dropout=0.2,feat_drop=0., attn_drop=0., heads=heads,att_ew=True, ew_dims=2, backbone='resnet18')
     #summary(model.feature_extractor, (1,112,112), device='cpu')
     test_dataset = nuscenes_Dataset(train_val_test='val', rel_types=True, history_frames=history_frames, future_frames=future_frames, local_frame=False) 
     test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_batch)
