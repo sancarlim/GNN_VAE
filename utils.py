@@ -1,4 +1,5 @@
 import argparse
+from dgl.batch import batch
 import torch
 import numpy as np
 from typing import List, Tuple, Dict
@@ -8,11 +9,12 @@ from torch.nn import functional as f
 from nuscenes.eval.common.utils import quaternion_yaw
 from pyquaternion import Quaternion
 from nuscenes.map_expansion.map_api import NuScenesMap
+from nuscenes.map_expansion import arcline_path_utils
 from nuscenes.prediction import PredictHelper
 from nuscenes.prediction.input_representation.static_layers import load_all_maps
 from scipy import interpolate
 
-
+DATAROOT = '/media/14TBDISK/nuscenes'
 class MTPLoss:
     """ Computes the loss for the MTP model. """
 
@@ -49,6 +51,29 @@ class MTPLoss:
         return trajectories_no_modes, mode_probabilities
 
     @staticmethod
+    def _angle_wrt_x(traj_to_compare: torch.Tensor,
+                     actual_yaw: float) -> float:
+        """
+        Computes the angle wrt x axis, ie the heading in local frame.
+        The resulting angle is in degrees and is an angle in the [0; 180) interval.
+        :param ref_traj: Tensor of shape [n_timesteps, 2].
+        :param traj_to_compare: Tensor of shape [n_timesteps, 2].
+        :return: Angle between the trajectories.
+        """
+
+        # Compute angle wrt x axis
+        last_index_non_zero = torch.nonzero(traj_to_compare[:,0])[-1].item()
+        ref_traj =  torch.tensor((traj_to_compare[last_index_non_zero][0], 0))
+        traj_norms_product = float(torch.norm(ref_traj) * torch.norm(traj_to_compare[last_index_non_zero]))
+        dot_product = float(ref_traj.dot(traj_to_compare[last_index_non_zero]))
+        if math.isclose(traj_norms_product, 0):
+            return 0.
+        angle = math.acos(max(min(dot_product / traj_norms_product, 1), -1)) + actual_yaw
+        return angle             
+
+
+
+    @staticmethod
     def _angle_between(ref_traj: torch.Tensor,
                        traj_to_compare: torch.Tensor) -> float:
         """
@@ -78,7 +103,7 @@ class MTPLoss:
         # returned for cos_angle that is greater than 1 or less than -1.
         # This should never be the case, but the check is in place for cases where
         # we might encounter numerical instability.
-        dot_product = float(ref_traj[-1].dot(traj_to_compare[-1]))
+        dot_product = float(ref_traj[-1].dot(traj_to_compare[-1]))  # = u*v*cos(angle)
         angle = math.degrees(math.acos(max(min(dot_product / traj_norms_product, 1), -1)))
 
         if angle >= 180:
@@ -97,6 +122,43 @@ class MTPLoss:
         l2_norms = torch.norm(tensor[:mask.nonzero()[-1]+1], p=2, dim=2)
         avg_distance = torch.mean(l2_norms)
         return avg_distance.item()
+
+    @staticmethod
+    def _get_lane_pos(nusc_map: str,
+                        current_lane: torch.Tensor,
+                        trajectories: torch.Tensor,
+                        current_angle: torch.Tensor) -> List[Tuple[float, int]]:
+        """
+        Get lane projections from trajectories' predictions.
+        :trajectories: Shape [n_modes, T, 2]
+        """
+        current_lane_record = nusc_map.get_arcline_path(current_lane)
+
+        # NOTE:
+        # Op 3. Only for test if too slown
+        # Op 2. for each t
+        # Op 1. for last t and use lanes to get the trajectory. SI sigue en la misma lane ya tienes la traj.
+
+        # Iterate over N modes
+        n_modes_poses = []
+        for traj in trajectories:
+            lane = nusc_map.get_closest_lane(traj[-1,0].item(), traj[-1,1].item(), radius=2)
+            lane_record = nusc_map.get_arcline_path(lane)
+            if lane_record != -1:
+                poses_on_lane = torch.Tensor([ arcline_path_utils.project_pose_to_lane((traj[i,0].item(), traj[i,1].item(), current_angle), lane_record)[0][:2] for i in range(traj.shape[0]) ]).type_as(traj)
+                # layers = nusc_map.layers_on_point(traj[0,0], traj[0,1])
+                # if layers['road_segment'] != '':
+                #   if nusc_map.get('road_segment', layers['road_segment'])['is_intersection']:
+                # nusc_map.get_next_roads(traj[0,0], traj[0,1])
+                # out_lanes = nusc_map.get_outgoing_lane_ids(current_lane)
+                n_modes_poses.append(poses_on_lane)
+            else:
+                n_modes_poses.append(torch.ones_like(traj)*-1)
+                print('lane record = -1')
+        
+        return n_modes_poses
+        
+
 
     def _compute_angles_from_ground_truth(self, target: torch.Tensor,
                                           trajectories: torch.Tensor) -> List[Tuple[float, int]]:
@@ -160,7 +222,8 @@ class MTPLoss:
         return best_mode
 
 
-    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, last_loc: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def __call__(self, predictions: torch.Tensor, types: torch.Tensor, targets: torch.Tensor, last_loc: torch.Tensor, mask: torch.Tensor, 
+                    local_frame: bool, location: np.array, lanes: np.array, global_feats: torch.Tensor) -> torch.Tensor:
         """
         Computes the MTP loss on a batch.
         The predictions are of shape [batch_size, n_ouput_neurons of last linear layer]
@@ -180,43 +243,63 @@ class MTPLoss:
         else:
             trajectories = predictions[:,:,:-1].clone().view(targets.shape[0], self.num_modes, -1, self.num_location_coordinates_predicted)
             modes = predictions[:,:,-1].clone().transpose(1,0)
+        
+        for j in range(1,targets.shape[-2]):
+                trajectories[:,:,j,:] = torch.sum(trajectories[:,:,j-1:j+1,:],dim=-2) 
+
         '''
-        for mode in range(self.num_modes):
-            for i in range(1,trajectories.shape[-2]):
-                trajectories[:,mode,i,:] = torch.sum(trajectories[:,mode,i-1:i+1,:],dim=-2) 
-        trajectories += last_loc
-        '''
+        if not local_frame:
+            for mode in range(self.num_modes):
+                for i in range(1,trajectories.shape[-2]):
+                    trajectories[:,mode,i,:] = torch.sum(trajectories[:,mode,i-1:i+1,:],dim=-2) 
+            trajectories += last_loc
+        '''    
         trajectories = trajectories * mask
-        targets = targets * mask
+        targets = targets * mask 
+        current_location = location[0]
+        nusc_map = NuScenesMap(map_name=current_location, dataroot=DATAROOT) 
 
         for batch_idx in range(targets.shape[0]): #-1 to not take into account ego
-            
+            trajs = [ convert_local_coords_to_global(trajectory, global_feats[batch_idx,:2], global_feats[batch_idx,2]) for trajectory in trajectories[batch_idx] ]
+                    
             if not mask[batch_idx].squeeze().any():
-                best_trajs = torch.cat((best_trajs, trajectories[batch_idx, 0, :].unsqueeze(0)), 0)
+                best_trajs = torch.cat((best_trajs, trajs[0].unsqueeze(0)), 0)
                 continue
             
+            if types[batch_idx] != 2:
+                if location[batch_idx] != current_location:
+                    nusc_map = NuScenesMap(map_name=location, dataroot=DATAROOT) 
+                    current_location = location[batch_idx]
+
+                traj_lanes = self._get_lane_pos(nusc_map, lanes[batch_idx], trajs,  global_feats[batch_idx,2])
+                for n in range(len(trajs)):
+                    if traj_lanes[n][0,0] != -1:
+                        trajs[n] = traj_lanes[n]
             '''
             angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
-                                                            trajectories=trajectories[batch_idx])
+                                                            trajectories=trajs)
 
             
             best_mode = self._compute_best_mode(angles,
                                                 target=targets[batch_idx],
-                                                trajectories=trajectories[batch_idx],
+                                                trajectories=trajs,
                                                 mask=mask[batch_idx].squeeze())
 
             '''
             distances_from_ground_truth = []
+            #distances_lanes = []
             for mode in range(self.num_modes):
-                norm = self._compute_ave_l2_norms(targets[batch_idx] - trajectories[batch_idx][mode, :, :], mask[batch_idx].squeeze())
+                norm = self._compute_ave_l2_norms(targets[batch_idx] - trajs[mode], mask[batch_idx].squeeze())
+                #norm_lanes = self._compute_ave_l2_norms(targets[batch_idx] - traj_lanes[mode], mask[batch_idx].squeeze())
 
                 distances_from_ground_truth.append((norm, mode))
+                #distances_lanes.append((norm_lanes, mode))
 
             distances_from_ground_truth = sorted(distances_from_ground_truth)
             best_mode = distances_from_ground_truth[0][1]
             
 
-            best_mode_trajectory = trajectories[batch_idx, best_mode, :].unsqueeze(0)
+            best_mode_trajectory = trajs[best_mode].unsqueeze(0)
             
             regression_loss = f.smooth_l1_loss(best_mode_trajectory, targets[batch_idx])
             
@@ -230,6 +313,7 @@ class MTPLoss:
             class_losses = torch.cat((class_losses, classification_loss.unsqueeze(0)), 0)
             regression_losses = torch.cat((regression_losses, regression_loss.unsqueeze(0)), 0)
             best_trajs = torch.cat((best_trajs, best_mode_trajectory), 0)
+            #trajs_lanes_all = torch.cat((trajs_lanes_all, best_mode_trajectory), 0)
 
         avg_loss = torch.mean(batch_losses)
         regression_avg_loss = torch.mean(regression_losses)
@@ -304,8 +388,8 @@ def make_2d_rotation_matrix(angle_in_radians: float) -> np.ndarray:
     by angle_in_radians.
     """
 
-    return np.array([[np.cos(angle_in_radians), -np.sin(angle_in_radians)],
-                     [np.sin(angle_in_radians), np.cos(angle_in_radians)]])
+    return torch.tensor([[torch.cos(angle_in_radians), -torch.sin(angle_in_radians)],
+                     [torch.sin(angle_in_radians), torch.cos(angle_in_radians)]], device=angle_in_radians.device)
 
 
 def angle_of_rotation(yaw: float) -> float:
@@ -315,7 +399,7 @@ def angle_of_rotation(yaw: float) -> float:
     :param yaw: Radians. Output of quaternion_yaw function.
     :return: Angle in radians.
     """
-    return (np.pi / 2) + np.sign(-yaw) * np.abs(yaw)
+    return (torch.tensor(math.pi) / 2) + torch.sign(-yaw) * torch.abs(yaw)
 
 
 def convert_global_coords_to_local(coordinates: np.ndarray,
@@ -346,7 +430,7 @@ def convert_global_coords_to_local(coordinates: np.ndarray,
 
 def convert_local_coords_to_global(coordinates: np.ndarray,
                                    translation: Tuple[float, float, float],
-                                   rotation: Tuple[float, float, float, float]) -> np.ndarray:
+                                   yaw: Tuple[float, float, float, float]) -> np.ndarray:
     """
     Converts local coordinates to global coordinates.
     :param coordinates: x,y locations. array of shape [n_steps, 2]
@@ -355,11 +439,11 @@ def convert_local_coords_to_global(coordinates: np.ndarray,
         Representation - cos(theta / 2) + (xi + yi + zi)sin(theta / 2).
     :return: x,y locations stored in array of share [n_times, 2].
     """
-    yaw = angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
+    yaw = angle_of_rotation(yaw) #angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
 
     transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
 
-    return np.dot(transform, coordinates.T).T[:, :2] + np.atleast_2d(np.array(translation)[:2])
+    return torch.matmul(transform, coordinates.T).T[:, :2] + torch.atleast_2d(translation[:2])
 
 
 class OffRoadRate:
