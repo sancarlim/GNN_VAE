@@ -19,8 +19,8 @@ import json
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
-history = 3
-future = 5
+history = 2
+future = 6
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames + 1#2s of history + 6s of prediction
@@ -29,8 +29,10 @@ total_feature_dimension = 16
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
 
 def collate_batch_test(samples):
-    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps, global_feats, lanes = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
+    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps, global_feats, lanes = map(list, zip(*samples))  
     masks = torch.vstack(masks)
+    for lane in lanes[1:]:
+        lanes[0].update(lane)
     feats = torch.vstack(feats)
     global_feats = torch.vstack(global_feats)
     gt = torch.vstack(gt).float()
@@ -43,13 +45,18 @@ def collate_batch_test(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps, global_feats, lanes
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps, global_feats, lanes[0]
 
 
-def collate_batch(samples):
-    graphs, masks, feats, gt, maps, scene_id, tokens, mean_xy, global_feats, lanes = map(list, zip(*samples))  # samples is a list of tuples
+def collate_batch_ns(samples):
+    graphs, masks, feats, gt, maps, scene_id, tokens, mean_xy, global_feats, lanes = map(list, zip(*samples)) 
     if maps[0] is not None:
         maps = torch.vstack(maps)
+    
+    if lanes[0] != -1:
+        for lane in lanes[1:]:
+            lanes[0].update(lane)
+
     masks = torch.vstack(masks)
     feats = torch.vstack(feats)
     tokens = np.vstack(tokens)
@@ -62,13 +69,13 @@ def collate_batch(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_id[0], tokens, mean_xy, global_feats, lanes
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_id[0], tokens, mean_xy, global_feats, lanes[0]
 
 
 class nuscenes_Dataset(torch.utils.data.Dataset):
 
     def __init__(self, train_val_test='train', history_frames=history_frames, future_frames=future_frames, 
-                    rel_types=True, challenge_eval=False, local_frame = True):
+                    rel_types=True, local_frame = True, retrieve_lanes = True, step = 1):
         '''
             :classes:   categories to take into account
             :rel_types: wether to include relationship types in edge features 
@@ -79,15 +86,26 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         self.future_frames = future_frames
         self.types = rel_types
         self.local_frame = local_frame
-        
+        self.retrieve_lanes = retrieve_lanes
+        self.step = step
+
         if train_val_test == 'train':
-            self.raw_dir =os.path.join(base_path, 'ns_3s_train.pkl' )#train_val_test = 'train_filter'
+            if self.history_frames == 5:
+                self.raw_dir =os.path.join(base_path, 'ns_2s6s_train.pkl' )#train_val_test = 'train_filter'
+            elif self.history_frames == 8:
+                self.raw_dir =os.path.join(base_path, 'ns_4s_train.pkl' )
+            else:
+                self.raw_dir =os.path.join(base_path, 'ns_3s_train.pkl' )
         else:
-            self.raw_dir = os.path.join(base_path,'ns_3s_test.pkl')  #ns_challenge_json_3s_test.pkl
-            #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
+            if self.history_frames == 5:
+                self.raw_dir = os.path.join(base_path,'ns_2s6s_test.pkl')  #ns_challenge_json_3s_test.pkl
+                #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
+            elif self.history_frames == 8:
+                self.raw_dir =os.path.join(base_path, 'ns_4s_test.pkl' )
+            else:
+                self.raw_dir =os.path.join(base_path, 'ns_3s_test.pkl' )
         
         #self.raw_dir = os.path.join(base_path,'ns_step1_train' + train_val_test + '.pkl')
-        self.challenge_eval = challenge_eval
         self.transform = transforms.Compose(
                             [
                                 transforms.ToTensor(),
@@ -110,19 +128,30 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_tokens = self.all_tokens[3660:]
             '''
         
-        with open(os.path.join(base_path, 'lanes', self.train_val_test + '.json')) as lanes_json:
-            self.lanes = json.load(lanes_json)
+        if self.retrieve_lanes:
+            with open(os.path.join(base_path, 'lanes', self.train_val_test + '_np.pkl'), 'rb') as lanes_pkl:
+                self.lanes = pickle.load(lanes_pkl)
+
 
         if self.train_val_test == 'train': 
-            with open(os.path.join(base_path,'ns_3s_val.pkl'), 'rb') as reader:
+            if self.history_frames == 5:
+                path = os.path.join(base_path,'ns_2s6s_val.pkl')
+            elif self.history_frames == 8:
+                path = os.path.join(base_path,'ns_4s_val.pkl')
+            else:
+                path = os.path.join(base_path,'ns_3s_val.pkl')
+
+            with open(path, 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
+
             self.all_feature = np.vstack((self.all_feature, all_feature))
             self.all_adjacency = np.vstack((self.all_adjacency,all_adjacency))
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
 
-            with open(os.path.join(base_path, 'lanes', 'val')) as lanes_json:
-                self.lanes.update(json.load(lanes_json))
+            if self.retrieve_lanes:
+                with open(os.path.join(base_path, 'lanes', 'val_np.pkl'), 'rb') as lanes_pkl:
+                    self.lanes.update(pickle.load(lanes_pkl))
         '''
             with open(os.path.join(base_path,'nuscenes_test.pkl'), 'rb') as reader:
                 [all_feature, all_adjacency, all_mean_xy,all_tokens]= pickle.load(reader)
@@ -132,7 +161,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
         '''
-        step = 3
+        step = self.step
         self.all_feature = self.all_feature[::step] 
         self.all_adjacency =  self.all_adjacency[::step] 
         self.all_mean_xy = self.all_mean_xy[::step] 
@@ -177,12 +206,12 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             all_feature = self.all_feature.clone()
             for seq in range(self.all_feature.shape[0]):
                 index = torch.tensor( [ int(torch.nonzero(mask_i)[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-1]])
-                all_feature[seq,:self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], True) for i in range(self.num_visible_object[seq]-1)])
+                all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:self.history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], self.history_frames) for i in range(self.num_visible_object[seq]-1)])
                 # Convert ego feats
-                index = torch.nonzero(self.all_feature[seq, self.num_visible_object[seq]-1, :history_frames, 0])[0][0]
-                all_feature[seq,self.num_visible_object[seq]-1,:history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,self.num_visible_object[seq]-1,index:history_frames,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,2], True)])
+                index = torch.nonzero(self.all_feature[seq, self.num_visible_object[seq]-1, :self.history_frames, 0])[0][0]
+                all_feature[seq,self.num_visible_object[seq]-1,:self.history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,self.num_visible_object[seq]-1,index:self.history_frames,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,:2], self.all_feature[seq,self.num_visible_object[seq]-1,now_history_frame,2], self.history_frames)])
                 
-                all_feature[seq,:self.num_visible_object[seq],history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], False) for i in range(self.num_visible_object[seq])])
+                all_feature[seq,:self.num_visible_object[seq],self.history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,self.history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], -1) for i in range(self.num_visible_object[seq])])
             
             self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
             '''
@@ -237,15 +266,20 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
         ### Include ego in feats and labels
         feats[-1,:,-1] = 1
-        self.output_mask[idx, self.num_visible_object[idx]-1, self.history_frames:] = 1
-        
+        output_mask[-1,:] = 1
         ### Load Lanes in 50m radius for all agents in this sample
-        lanes = self.lanes[sample_token]      
+        if self.retrieve_lanes:
+            lanes = {sample_token: self.lanes[sample_token]}     
+        else:
+            lanes = -1
 
         ### Load Maps for all agents in this sample
         with open(os.path.join(self.map_path, sample_token + '.pkl'), 'rb') as reader:
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
+
+        if maps.shape[0] != feats.shape[0]:
+            print('hey')
 
         ### Load tokens: instance, sample, location, current lane
         tokens = self.all_tokens[idx]
@@ -279,19 +313,16 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
                 os.makedirs(path)
             cv2.imwrite(os.path.join(path,sample_token+f'agent_{i}.jpg'),cv2.cvtColor(img[i].transpose(1,2,0), cv2.COLOR_RGB2BGR))
         """
-
-        if self.challenge_eval:
-            return graph, output_mask, feats, gt, tokens, scene_id, self.all_mean_xy[idx,:2], maps, global_feats, lanes
-        
         
         return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx]), tokens, self.all_mean_xy[idx,:2], global_feats, lanes
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=True, local_frame=False)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='test', local_frame=False, retrieve_lanes=False, history_frames=5, step=1)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
-    test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_test) )
-    for batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens, scene_id, mean_xy, maps, global_feats  in test_dataloader:
+    test_dataloader=iter(DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_batch_ns) )
+    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps,  scene_id, tokens, mean_xy,  global_feats, lanes  in test_dataloader:
         print(feats.shape, maps.shape, scene_id)
+
     
