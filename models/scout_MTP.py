@@ -1,3 +1,4 @@
+from pickle import TRUE
 import sys
 sys.path.append('..')
 import dgl
@@ -9,12 +10,12 @@ import torch.nn.functional as F
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 from torch.utils.data import DataLoader
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch, collate_batch_test
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns, collate_batch_test
 from torchvision.models import resnet18
 from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
-import utils
+from utils import MTPLoss
 from nuscenes.nuscenes import NuScenes
 from nuscenes.prediction import PredictHelper
 
@@ -292,6 +293,7 @@ class SCOUT_MTP(nn.Module):
 
         else:
             feature_extractor = None
+            emb_dim = hidden_dim
 
         backbone_feature_dim = calculate_backbone_feature_dim(feature_extractor, input_shape = (3,224,224)) if backbone != 'None' else 0
         '''
@@ -411,15 +413,15 @@ class SCOUT_MTP(nn.Module):
         else:
             #reshape to have shape (B*V,T*C) [c1,c2,...,c6]
             feats = feats.contiguous().view(feats.shape[0],-1)
-            h_enc = self.embeddings['embedding_h'](feats)  #[N,hidds]   
+            h = self.embeddings['embedding_h'](feats)  #[N,hidds]   
 
         if self.backbone != 'None':
             # Maps feature extraction
             maps_embedding = self.embeddings['map_encoder'](maps)  
             if self.emb_type == 'pos_enc':
-                maps_embedding = maps_embedding.unsqueeze(1).repeat(1,h_enc.shape[1],1)
+                maps_embedding = maps_embedding.unsqueeze(1).repeat(1,h.shape[1],1)
             # Embeddings concatenation
-            h = torch.cat([maps_embedding, h_enc], dim=-1)
+            h = torch.cat([maps_embedding, h], dim=-1)
             h = self.embeddings['linear_cat'](h)
         
         #h = F.relu(h)
@@ -483,7 +485,7 @@ class SCOUT_MTP(nn.Module):
 if __name__ == '__main__':
 
     history_frames = 7
-    future_frames = 5
+    future_frames = 10
     hidden_dims = 256
     heads = 2
     emb_type = 'emb'
@@ -492,7 +494,7 @@ if __name__ == '__main__':
     output_dim = 2*future_frames + 1
 
     model = SCOUT_MTP(input_dim=input_dim, hidden_dim=hidden_dims, emb_dim=512, emb_type=emb_type, output_dim=output_dim, heads=heads,  ew_dims= 2,
-                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='resnet50', freeze=True)
+                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='mobilenet', freeze=True)
     
     #DATAROOT = '/media/14TBDISK/nuscenes'
     #nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
@@ -503,21 +505,26 @@ if __name__ == '__main__':
     snorm_e = torch.rand(3, 1)
     feats = torch.rand(3, history_frames, 7)
     maps = torch.rand(3, 3, 112, 112)
-    #out = model(g, feats, e_w,  maps)
+    out = model(feats, e_w,  maps, g)
 
     #desired_shape = (out.shape[0], 3, -1, 2)
     #trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
 
     #off_road = utils.OffRoadRate(helper)
-    
+    mtp_loss = MTPLoss(num_modes = 3, regression_loss_weight = 1, angle_threshold_degrees = 5.)
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, challenge_eval=True, local_frame=False) 
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_test)
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames,  local_frame=False) 
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_ns)
+
 
     for batch in test_dataloader:
-        batched_graph, ew, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens,  scene, mean_xy, maps ,global_feats = batch
-        #e_w = batched_graph.edata['w']#.unsqueeze(1)
-        out = model(batched_graph, feats,ew, maps)
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens,  scene, mean_xy, maps, global_feats, lanes = batch
+
+        ew = batched_graph.edata['w']#.unsqueeze(1)
+        out = model(feats,ew, maps, batched_graph)
+        avg_loss, regression_avg_loss, class_avg_loss, best_trajs = mtp_loss(out, feats[:,5,5], global_feats[:,history_frames:,:2].unsqueeze(1), None, output_masks.unsqueeze(1), 
+                                    True, tokens, lanes, global_feats[:,history_frames-1])
+
         '''
         desired_shape = (out.shape[0], 3, -1, 2)
         trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape).transpose(0,1)

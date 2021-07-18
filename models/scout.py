@@ -12,7 +12,7 @@ import dgl.function as fn
 from dgl.nn.pytorch.conv.gatconv import edge_softmax, Identity, expand_as_pair
 import math
 from torch.utils.data import DataLoader
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 from torchvision.models import resnet18
 from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
@@ -23,11 +23,13 @@ from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbon
 class GATConv(nn.Module):
     def __init__(self,
                  in_feats,
+                 ew_dims,
                  out_feats,
                  num_heads,
                  feat_drop=0.6,
                  attn_drop=0.6,
                  negative_slope=0.2,
+                 att_ew=False,
                  residual=False,
                  activation=F.elu):
         super(GATConv, self).__init__()
@@ -35,6 +37,10 @@ class GATConv(nn.Module):
         self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
         self._out_feats = out_feats
         self.fc = nn.Linear(self._in_src_feats, out_feats * num_heads, bias=False)
+        if att_ew:
+            self.attn_ew = nn.Parameter(th.FloatTensor(size=(1, num_heads, ew_dims)))
+        else:
+            self.register_buffer('attn_ew', None)
         self.attn_l = nn.Parameter(th.FloatTensor(size=(1, num_heads, out_feats)))
         self.attn_r = nn.Parameter(th.FloatTensor(size=(1, num_heads, out_feats)))
         self.feat_drop = nn.Dropout(feat_drop)
@@ -68,23 +74,13 @@ class GATConv(nn.Module):
             nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
         nn.init.xavier_normal_(self.attn_l, gain=gain)
         nn.init.xavier_normal_(self.attn_r, gain=gain)
+        if self.attn_ew is not None:
+            nn.init.xavier_normal_(self.attn_ew, gain=gain)
         if isinstance(self.res_fc, nn.Linear):
             nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
 
-    def forward(self, graph, feat, get_attention=False):
+    def forward(self, graph, feat, e_w, get_attention=False):
         with graph.local_scope():
-            if (graph.in_degrees() == 0).any():
-                raise DGLError('There are 0-in-degree nodes in the graph, '
-                                'output for those nodes will be invalid. '
-                                'This is harmful for some applications, '
-                                'causing silent performance regression. '
-                                'Adding self-loop on the input graph by '
-                                'calling `g = dgl.add_self_loop(g)` will resolve '
-                                'the issue. Setting ``allow_zero_in_degree`` '
-                                'to be `True` when constructing this module will '
-                                'suppress the check and let the code run.')
-
-            
             h_src = h_dst = self.feat_drop(feat)
             feat_src = feat_dst = self.fc(h_src).view(-1, self._num_heads, self._out_feats)
 
@@ -97,12 +93,16 @@ class GATConv(nn.Module):
             # save [Wh_i || Wh_j] on edges, which is not memory-efficient. Plus,
             # addition could be optimized with DGL's built-in function u_add_v,
             # which further speeds up computation and saves memory footprint.
-            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)   # AÑADIR AQUÍ FEATS E_W
-            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
+            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)  
+            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1) 
+            
             graph.srcdata.update({'ft': feat_src, 'el': el})
             graph.dstdata.update({'er': er})
             # compute edge attention, el and er are a_l Wh_i and a_r Wh_j respectively.
             graph.apply_edges(fn.u_add_v('el', 'er', 'e'))
+            if self.attn_ew is not None:
+                ew = (e_w.view(-1, self._num_heads, e_w.shape[-1]) * self.attn_ew).sum(dim=-1).unsqueeze(-1)
+                graph.edata['e'] = graph.edata['e'] + ew
             e = self.leaky_relu(graph.edata.pop('e'))
             # compute softmax
             graph.edata['a'] = self.attn_drop(edge_softmax(graph, e))
@@ -175,10 +175,11 @@ class My_GATLayer(nn.Module):
         h = h_s + torch.sum(a * nodes.mailbox['z'], dim=1)
         return {'h': h}
                                
-    def forward(self, g, h):
+    def forward(self, g, h, e_w):
         with g.local_scope():
             h_in = h.clone()
             g.ndata['h']  = h 
+            g.edata['w'] = e_w
             #feat dropout
             h=self.feat_drop_l(h)
             g.ndata['h_s'] = self.linear_self(h) 
@@ -188,9 +189,9 @@ class My_GATLayer(nn.Module):
             h = g.ndata['h'] #+g.ndata['h_s'] 
             #h = h * snorm_n # normalize activation w.r.t. graph node size
             if self.relu:
-                h = F.selu(h) # non-linear activation #DEAD RELU
+                h = F.selu(h) 
             if self.res_con:
-                h = h_in + h # residual connection           
+                h = h_in + h 
             return h #graph.ndata.pop('h') - another option to g.local_scope()
 
 
@@ -199,15 +200,15 @@ class MultiHeadGATLayer(nn.Module):
         super(MultiHeadGATLayer, self).__init__()
         self.heads = nn.ModuleList()
         for i in range(num_heads):
-            self.heads.append( GATConv(in_feats, out_feats, 1, feat_drop, attn_drop, residual=True, activation=F.elu) )
+            self.heads.append( GATConv(in_feats, e_dims, out_feats, 1, feat_drop, attn_drop, residual=True, att_ew=att_ew, activation=F.elu) )
             #self.heads.append(My_GATLayer(in_feats, out_feats, e_dims, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection))
         self.merge = merge
 
-    def forward(self, g, h):
+    def forward(self, g, h, e_w):
         if isinstance(h, list):
-            head_outs = [attn_head(g, h_mode) for attn_head, h_mode in zip(self.heads, h)]
+            head_outs = [attn_head(g, h_mode, e_w) for attn_head, h_mode in zip(self.heads, h)]
         else:
-            head_outs = [attn_head(g, h) for attn_head in self.heads]
+            head_outs = [attn_head(g, h, e_w) for attn_head in self.heads]
             
         if self.merge == 'cat':
             # concat on the output feature dimension (dim=1), for intermediate layers
@@ -265,7 +266,8 @@ class SCOUT(nn.Module):
         elif backbone == 'resnet18':       
             self.feature_extractor = ResNetBackbone('resnet18', freeze = freeze) #ResNet18(hidden_dim, freeze)  [n, 512] #9 layers (con avgpool) - if freeze=8 train last conv block
             #self.hidden_dim = hidden_dim + hidden_dim * 2
-
+        elif backbone == 'resnet34':       
+            self.feature_extractor = ResNetBackbone('resnet34', freeze = freeze) 
         elif backbone == 'resnet50':       
             self.feature_extractor = ResNetBackbone('resnet50', freeze = freeze) #ResNet50(hidden_dim, freeze)  #[n,2048] #9 layers
             #self.hidden_dim = hidden_dim + hidden_dim * 2
@@ -352,7 +354,7 @@ class SCOUT(nn.Module):
         y=self.forward(g, feats, e_w, snorm_n, snorm_e, maps)
         return y
 
-    def forward(self, g, feats,e_w,snorm_n,snorm_e, maps):
+    def forward(self, feats, e_w, maps, g):
         #reshape to have shape (B*V,T*C) [c1,c2,...,c6]
         feats = feats.contiguous().view(feats.shape[0],-1)
 
@@ -379,24 +381,24 @@ class SCOUT(nn.Module):
             e = self.resize_e(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e(e_w)
         else:
             e = torch.ones((1, self.hidden_dim), device=h.device) * e_w
-        g.edata['w']=e
+        ##g.edata['w']=e
 
-        h = self.gat_1(g, h,snorm_n) 
+        h = self.gat_1(g, h, e) 
         
         if self.heads > 1:
             if self.ew_dims:
                 e = self.resize_e2(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e2(e_w)
             else:
                 e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
-            g.edata['w']=e
+            ##g.edata['w']=e
         
-        h_modes = self.gat_2(g, h, snorm_n)  #BN Y RELU DENTRO DE LA GAT_LAYER
+        h = self.gat_2(g, h, e)  #BN Y RELU DENTRO DE LA GAT_LAYER
 
-        h_modes=self.dropout_l(h_modes)
+        h =self.dropout_l(h)
 
-        y = self.linear1(h_modes)
+        y = self.linear1(h)
 
-        h=self.dropout_l(h_modes)
+        h=self.dropout_l(h)
         y = self.linear1(h)
         return y  #return trajectory / final position + probability
         
