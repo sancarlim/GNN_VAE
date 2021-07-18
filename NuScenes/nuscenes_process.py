@@ -1,6 +1,7 @@
 import sys
 import os
 import numpy as np
+from numpy.core.fromnumeric import mean
 from scipy import spatial 
 import pickle
 import torch 
@@ -31,8 +32,8 @@ total_feature_dimension = 16 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
-history = 3
-future = 5
+history = 2
+future = 6
 history_frames = history*FREQUENCY 
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames + 1 #2s of history + 6s of prediction
@@ -226,7 +227,7 @@ def augment(scene):
     return scene_aug
 
 
-def process_tracks(tracks, start_frame, end_frame, current_frame):
+def process_tracks(tracks, start_frame, end_frame, current_frame, nusc_map):
     '''
         Tracks: a list of (n_frames ~40f = 20s) tracks_per_frame ordered by frame.
                 Each row (track) contains a dict, where each key corresponds to an array of data from all agents in that frame.
@@ -285,7 +286,7 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
         object_feature_list.append(np.zeros(shape=(num_visible_object,total_feature_dimension)))
         start_frame += 1
     
-    now_all_object_id = set([val for frame in range(start_frame, end_frame) for val in tracks[frame]["node_id"]])  #todos los obj en los15 hist frames
+    #now_all_object_id = set([val for frame in range(start_frame, end_frame) for val in tracks[frame]["node_id"]])  #todos los obj en los15 hist frames
 
     for frame_ind in range(start_frame, end_frame + 1):	
         now_frame_feature_dict = {node_id : (
@@ -300,6 +301,14 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
         ego_feature = np.array((list(tracks[frame_ind]['position'][-1] - mean_xy) + list(tracks[frame_ind]['motion'][-1]) + list(tracks[frame_ind]['info_agent'][-1]) + list(tracks[frame_ind]['info_sequence'][-1]) + [0] + [num_visible_object])).reshape(1, total_feature_dimension)
         now_frame_feature = np.vstack((now_frame_feature, ego_feature))
         object_feature_list.append(now_frame_feature)
+        
+        if frame_ind == current_frame:
+            lanes = []
+            for v in now_frame_feature:
+                if v[8]!=2:
+                    lanes.append(nusc_map.get_closest_lane(v[0] + mean_xy[0], v[1] + mean_xy[1], radius=2))
+                else:
+                    lanes.append('-1')
 
     
     object_feature_list = np.array(object_feature_list)  # T,V,C
@@ -308,7 +317,7 @@ def process_tracks(tracks, start_frame, end_frame, current_frame):
     assert object_feature_list.shape[0] == total_frames
     object_frame_feature = np.zeros((max_num_objects, total_frames, total_feature_dimension))  # V, T, C
     object_frame_feature[:num_visible_object] = np.transpose(object_feature_list, (1,0,2))
-    inst_sample_tokens = np.column_stack((tracks[current_frame]['node_id'], tracks[current_frame]['sample_token']))
+    inst_sample_tokens = np.column_stack((tracks[current_frame]['node_id'], tracks[current_frame]['sample_token'], np.array(lanes)))
     #visible_object_indexes = [list(now_all_object_id).index(i) for i in visible_node_id_list]
     return object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens
 
@@ -319,6 +328,9 @@ def process_scene(scene):
     Each row contains a dict, where each key corresponds to an array of data from all agents in that frame.
     '''
     scene_id = int(scene['name'].replace('scene-', ''))   #419 la que data empieza en frame 4 data.frame_id.unique() token '8c84164e752a4ab69d039a07c898f7af'
+    location = nuscenes.get('log', ns_scene['log_token'])['location']
+    nusc_map = NuScenesMap(map_name=location, dataroot=DATAROOT)
+    location = np.array(location)
     data = pd.DataFrame(columns=['scene_id',
                                  'sample_token',
                                  'frame_id',
@@ -455,6 +467,7 @@ def process_scene(scene):
     maps_list = []
     visible_object_indexes_list=[]
     step=1 #iterate over <step> frames
+    
     for i in range(1,len(frame_id_list[:-future_frames])):  #, frame in enumerate(frame_id_list[1:-total_frames+1:step]):
         # Avoid sequences where only ego_vehicle is present
         if len(tracks[i]['frame_id']) < 2:
@@ -462,7 +475,8 @@ def process_scene(scene):
         current_ind = i #start_ind + history_frames -1   #0,8,16,24
         start_ind = current_ind - history_frames
         end_ind = current_ind + future_frames
-        object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind)  
+        object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens = process_tracks(tracks, start_ind, end_ind, current_ind, nusc_map)  
+        inst_sample_tokens = np.column_stack((inst_sample_tokens,location.repeat(inst_sample_tokens.shape[0])))
         '''
         #HD MAPs
         # Retrieve ego_vehicle pose
@@ -506,7 +520,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 
 
 #scenes_df=[]
-for data_class in ['train']:
+for data_class in ['train', 'val', 'test']:
     scenes_token_set=set()
     for ann in ns_scene_names[data_class]:
         _, sample_token=ann.split("_")
@@ -539,7 +553,7 @@ for data_class in ['train']:
     all_adjacency = np.array(all_adjacency) 
     all_mean_xy = np.array(all_mean_xy) 
     all_tokens = np.array(all_tokens)
-    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_3s_' + data_class + '.pkl'
+    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_2s6s_' + data_class + '.pkl'
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')
