@@ -136,7 +136,7 @@ def process_tracks(tracks,  start_frame, end_frame, current_frame,sample_token, 
         
         Returns data processed for a sequence of 8s (2s of history, 6s of labels)
     '''
-    visible_node_id_list = tracks[current_frame]["node_id"][:-1]  #All agents in the current frame      
+    visible_node_id_list = tracks[current_frame]["node_id"][:-1]  #All agents in the current frame but ego (changes token in each frame)    
 
     current_anns = [instance + '_' + sample_token for instance in visible_node_id_list]
     challenge_anns = [ ann.split('_')[0] for ann in current_anns if ann in annotations ]
@@ -412,7 +412,7 @@ ns_scene_names['test'] = get_prediction_challenge_split("val", dataroot=DATAROOT
 #scenes_df=[]
 #nuscenes.field2token('scene', 'name','scene-0')[0]
 
-for data_class in ['train','val','test']:
+for data_class in ['test']:
     scenes_token_set=set()
     samples = []
     instances = []
@@ -430,7 +430,7 @@ for data_class in ['train','val','test']:
     all_tokens = []
     
     for scene_token in scenes_token_set:
-        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', scene_token), samples, instances, annotations)   # 780 scene_token = '656bb27689dc4e9b8e4559e3f6a7e534'
+        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', nuscenes.field2token('scene', 'name','scene-0272')[0]), samples, instances, annotations)   # 780 scene_token = '656bb27689dc4e9b8e4559e3f6a7e534'
         #process_scene(nuscenes.get('scene', scene_token), samples, instances)
         print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed!")# {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
     

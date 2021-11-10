@@ -7,7 +7,7 @@ os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 import matplotlib.pyplot as plt
 from torchvision.models import resnet18, resnet50
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder, ResNet50, ResNet18
 from models.VAE_GNN import GAT_VAE
@@ -260,7 +260,7 @@ class VAE_GNN_prior(nn.Module):
         ############# 
         #self.embedding_z = nn.Linear(z_dim, hidden_dim)
         #dec_dims = hidden_dim 
-        GNN_decoder = GAT_VAE(dec_dims, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=False, ew_dims=ew_dims) #If att_ew --> embedding_e_dec
+        GNN_decoder = GAT_VAE(dec_dims, dropout=dropout, feat_drop=feat_drop, attn_drop=attn_drop, heads=heads, att_ew=att_ew, ew_dims=ew_dims) #If att_ew --> embedding_e_dec
         MLP_decoder = MLP_Dec(dec_dims+z_dim, dec_dims, output_dim, dropout) #dec_dims*heads
         
         self.base = nn.ModuleDict({
@@ -271,7 +271,7 @@ class VAE_GNN_prior(nn.Module):
             'GNN_decoder':  GNN_decoder,
             'MLP_decoder':  MLP_decoder
         })
-        joint_latent = Joint_Latent_opt(z_dim, attn_drop = attn_drop)
+        joint_latent = Joint_Latent(z_dim, attn_drop = attn_drop)
         self.base['joint_latent'] = joint_latent
 
         if self.bn:
@@ -330,7 +330,7 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_enc(h)
 
-        h = self.base['GNN_enc'](g, h, e_w, snorm_n)
+        h = self.base['GNN_enc'](g, h, e_w)
         h = torch.cat([h, gt], dim=-1)            
         mu, log_var = self.base['MLP_encoder'](h)   # Latent distribution
         
@@ -346,7 +346,7 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_enc(h_prior)
 
-        h_prior = self.base['GNN_prior'](g, h_prior, e_w, snorm_n)    
+        h_prior = self.base['GNN_prior'](g, h_prior, e_w)    
 
         mu_prior, log_var_prior = self.base['MLP_prior'](h_prior)   # Latent distribution
 
@@ -362,7 +362,7 @@ class VAE_GNN_prior(nn.Module):
         elif self.gn:
             h = self.gn_dec(h_dec)
             
-        h_dec = self.base['GNN_decoder'](g,h_dec,e_w,snorm_n)
+        h_dec = self.base['GNN_decoder'](g,h_dec,e_w)
         h_dec = torch.cat([h_dec, z_sample],dim=-1)
 
         return self.base['MLP_decoder'](h_dec) 
@@ -375,9 +375,9 @@ class VAE_GNN_prior(nn.Module):
         ####  EMBEDDINGS  ####
         if self.encoding_type == 'emb':
             # Reshape from (B*V,T,C) to (B*V,T*C) 
-            feats = features.contiguous().view(features.shape[0],-1)
+            #feats = features.contiguous().view(features.shape[0],-1)
             # Input embedding
-            h_emb = self.embedding_h(feats)  #input (N, 24)- (N,hid)
+            h_emb = self.embedding_h(features)  #input (N, 24)- (N,hid)
         else:
             h_emb = self.encode_h(self.leaky_relu(self.embedding_h(features)))[1].squeeze() 
         # Maps feature extraction
@@ -400,12 +400,12 @@ class VAE_GNN_prior(nn.Module):
         ####  EMBEDDINGS  ####
         # Map encoding
         maps_emb = self.feature_extractor(maps.contiguous())
-       ####  EMBEDDINGS  ####
+        ####  EMBEDDINGS  ####
         if self.encoding_type == 'emb':
             # Reshape from (B*V,T,C) to (B*V,T*C) 
-            feats = features.contiguous().view(features.shape[0],-1)
+            # feats = features.contiguous().view(features.shape[0],-1)
             # Input embedding
-            h_emb = self.embedding_h(feats)  #input (N, 24)- (N,hid)
+            h_emb = self.embedding_h(features)  #input (N, 24)- (N,hid)
         else:
             h_emb = self.encode_h(self.leaky_relu(self.embedding_h(features)))[1].squeeze() 
             
@@ -419,9 +419,9 @@ class VAE_GNN_prior(nn.Module):
         pred = [] #torch.Tensor().requires_grad_(True).to(feats.device)
         for _ in range(self.num_modes):
             #### Sample from the latent distribution ###
-            z_sample = self.reparameterize(mu_prior, log_var_prior)
-            z_sample = self.base['joint_latent'](g, z_sample)
-            pred.append( self.decode(g, h_emb, e_w, snorm_n, maps_emb, z_sample) )#torch.cat( ,  dim = 0) # 3, N, 25
+            z_sample = self.reparameterize(mu, log_var)
+            z_sample= self.base['joint_latent'](g, z_sample)
+            pred.append( self.decode(g, h_emb, e_w.squeeze(1), snorm_n, maps_emb, z_sample) ) # z_ij en lugar de e_w
         
         pred = torch.stack(pred,dim=0)
         return pred[:,:,:-1], pred[:,:,-1], [mu, log_var, mu_prior, log_var_prior]
@@ -436,7 +436,7 @@ if __name__ == '__main__':
     history_frames = 7
     future_frames = 10
     hidden_dims = 128
-    heads = 2
+    heads = 1
     emb_type = 'emb'
 
     input_dim = 7 if emb_type != 'emb' else 7*(history_frames)

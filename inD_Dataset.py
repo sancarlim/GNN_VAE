@@ -17,7 +17,7 @@ from dgl.data import DGLDataset
 from sklearn.preprocessing import StandardScaler
 
 
-def collate_batch(samples):
+def collate_batch_ind(samples):
     graphs, masks, feats, gt = map(list, zip(*samples))  # samples is a list of pairs (graph, mask) mask es VxTx1
     masks = torch.vstack(masks)
     feats = torch.vstack(feats)
@@ -29,12 +29,12 @@ def collate_batch(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, None
 
 
 class inD_DGLDataset(torch.utils.data.Dataset):
 
-    def __init__(self, train_val, history_frames, future_frames, test=False, data_path=None, classes=(1,2), rel_types=False):
+    def __init__(self, train_val, history_frames, future_frames, test=False, data_path=None, classes=(1,2), rel_types=False, model_type='gat'):
         
         self.train_val=train_val
         self.history_frames = history_frames
@@ -43,6 +43,7 @@ class inD_DGLDataset(torch.utils.data.Dataset):
         self.test = test
         self.classes = classes
         self.types = rel_types
+        self.model_type = model_type
 
         self.raw_dir='/media/14TBDISK/sandra/inD_processed/inD_2.5Hz8_12f_benchmark_train.pkl' #inD_2.5Hz8_12f_benchmark_train.pkl'   #inD_2.5Hz_3s5s.pkl'  
         if self.train_val == 'test':  
@@ -75,8 +76,6 @@ class inD_DGLDataset(torch.utils.data.Dataset):
             mask_car_t=torch.Tensor([1 if j in self.classes else 0 for j in self.object_type[i,:,now_history_frame]])#.to('cuda')
             mask_car[i,:]=mask_car_t.view(mask_car.shape[1],1)+torch.zeros(self.total_frames)#.to('cuda') #120x12
         '''
-        self.xy_dist=[spatial.distance.cdist(self.node_features[i][:,now_history_frame,:2], self.node_features[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
-        self.vel_l2 = [spatial.distance.cdist(self.node_features[i][:,now_history_frame,3:5].cpu(), self.node_features[i][:,now_history_frame,3:5].cpu()) for i in range(len(self.all_feature))]
         
         #rescale_xy=torch.ones((1,1,1,2))
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  #121  - test 119.3
@@ -90,6 +89,9 @@ class inD_DGLDataset(torch.utils.data.Dataset):
         self.track_info = self.all_feature[:,:,:,info_feats_id]
         self.output_mask= self.all_feature[:,:,self.history_frames:,-1] ###*mask_car  #mascara only_cars/peds visibles en 6º frame 
         self.output_mask = self.output_mask.unsqueeze_(-1) #(5010,120,T_hist,1)
+        
+        self.xy_dist=[spatial.distance.cdist(self.node_features[i][:,now_history_frame,:2], self.node_features[i][:,now_history_frame,:2]) for i in range(len(self.all_feature))]  #5010x70x70
+        self.vel_l2 = [spatial.distance.cdist(self.node_features[i][:,now_history_frame,3:5].cpu(), self.node_features[i][:,now_history_frame,3:5].cpu()) for i in range(len(self.all_feature))]
         
         id_list = list(set(list(range(total_num))))# - set(zero_indeces_list))
         total_valid_num = len(id_list)

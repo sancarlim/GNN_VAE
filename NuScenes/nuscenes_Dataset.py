@@ -28,28 +28,9 @@ max_num_objects = 150
 total_feature_dimension = 16
 base_path = '/media/14TBDISK/sandra/nuscenes_processed'
 
-def collate_batch_test(samples):
-    graphs, masks, feats, gt, tokens, scene_ids, mean_xy, maps, global_feats, lanes = map(list, zip(*samples))  
-    masks = torch.vstack(masks)
-    for lane in lanes[1:]:
-        lanes[0].update(lane)
-    feats = torch.vstack(feats)
-    global_feats = torch.vstack(global_feats)
-    gt = torch.vstack(gt).float()
-    if maps[0] is not None:
-        maps = torch.vstack(maps)
-    sizes_n = [graph.number_of_nodes() for graph in graphs] # graph sizes
-    snorm_n = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_n]
-    snorm_n = torch.cat(snorm_n).sqrt()  # graph size normalization 
-    sizes_e = [graph.number_of_edges() for graph in graphs] # nb of edges
-    snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
-    snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
-    batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, tokens[0], scene_ids[0], mean_xy, maps, global_feats, lanes[0]
-
 
 def collate_batch_ns(samples):
-    graphs, masks, feats, gt, maps, scene_id, tokens, mean_xy, global_feats, lanes = map(list, zip(*samples)) 
+    graphs, masks, feats, gt, maps, scene_id, tokens, mean_xy, global_feats, lanes, static_feats = map(list, zip(*samples)) 
     if maps[0] is not None:
         maps = torch.vstack(maps)
     
@@ -59,6 +40,7 @@ def collate_batch_ns(samples):
 
     masks = torch.vstack(masks)
     feats = torch.vstack(feats)
+    static_feats = torch.vstack(static_feats)
     tokens = np.vstack(tokens)
     global_feats = torch.vstack(global_feats)
     gt = torch.vstack(gt).float()
@@ -69,25 +51,26 @@ def collate_batch_ns(samples):
     snorm_e = [torch.FloatTensor(size, 1).fill_(1 / size) for size in sizes_e]
     snorm_e = torch.cat(snorm_e).sqrt()  # graph size normalization
     batched_graph = dgl.batch(graphs)  # batch graphs
-    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_id[0], tokens, mean_xy, global_feats, lanes[0]
+    return batched_graph, masks, snorm_n, snorm_e, feats, gt, maps, scene_id[0], tokens, mean_xy, global_feats, lanes[0], static_feats
 
 
 class nuscenes_Dataset(torch.utils.data.Dataset):
 
     def __init__(self, train_val_test='train', history_frames=history_frames, future_frames=future_frames, 
-                    rel_types=True, local_frame = True, retrieve_lanes = True, step = 1):
+                    rel_types=True, local_frame = True, retrieve_lanes = False, step = 1, test = False):
         '''
             :classes:   categories to take into account
             :rel_types: wether to include relationship types in edge features 
         '''
         self.train_val_test=train_val_test
         self.history_frames = history_frames
-        self.map_path = os.path.join(base_path, 'hd_maps_3') 
+        self.map_path = os.path.join(base_path, 'hd_maps_ego_history') 
         self.future_frames = future_frames
         self.types = rel_types
         self.local_frame = local_frame
         self.retrieve_lanes = retrieve_lanes
         self.step = step
+        self.test = test
 
         if train_val_test == 'train':
             if self.history_frames == 5:
@@ -98,12 +81,12 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
                 self.raw_dir =os.path.join(base_path, 'ns_3s_train.pkl' )
         else:
             if self.history_frames == 5:
-                self.raw_dir = os.path.join(base_path,'ns_2s6s_test.pkl')  #ns_challenge_json_3s_test.pkl
-                #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
+                self.raw_dir = os.path.join(base_path,'ns_2s6s_test.pkl')  
             elif self.history_frames == 8:
                 self.raw_dir =os.path.join(base_path, 'ns_4s_test.pkl' )
             else:
-                self.raw_dir =os.path.join(base_path, 'ns_3s_test.pkl' )
+                self.raw_dir =os.path.join(base_path, 'ns_3s_test.pkl' ) #ns_challenge_json_3s_test.pkl
+                #self.map_path = os.path.join(base_path, 'hd_maps_challenge_ego') 
         
         #self.raw_dir = os.path.join(base_path,'ns_step1_train' + train_val_test + '.pkl')
         self.transform = transforms.Compose(
@@ -148,7 +131,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_adjacency = np.vstack((self.all_adjacency,all_adjacency))
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
-
+        
             if self.retrieve_lanes:
                 with open(os.path.join(base_path, 'lanes', 'val_np.pkl'), 'rb') as lanes_pkl:
                     self.lanes.update(pickle.load(lanes_pkl))
@@ -161,6 +144,12 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.all_mean_xy = np.vstack((self.all_mean_xy,all_mean_xy))
             self.all_tokens = np.hstack((self.all_tokens,all_tokens ))
         '''
+        #Quitar de cada adj todas las filas que sean 0
+        new_adjacency = []
+        for i, adj in enumerate(self.all_adjacency):
+            adj_temp = self.all_adjacency[i][self.all_adjacency[i].any(0)]
+            new_adjacency.append(adj_temp[:,:len(adj_temp)])
+
         step = self.step
         self.all_feature = self.all_feature[::step] 
         self.all_adjacency =  self.all_adjacency[::step] 
@@ -171,7 +160,8 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
     def process(self):
         '''
         INPUT:
-            :all_feature:   x,y (global zero-centralized),heading,velx,vely,accx,accy,head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects (14)
+            :all_feature:   x,y (global zero-centralized),heading,velx,vely,accx,accy,head_rate, type, 
+                            l,w,h, frame_id, scene_id, mask, num_visible_objects, IS_INTERSECTION, STOP_LINE_TYPE (18)
             :all_mean_xy:   mean_xy per sequence for zero centralization
             :all_adjacency: Adjacency matrix per sequence for building graph
             :all_tokens:    Instance token, scene token
@@ -183,17 +173,28 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         '''
         total_num = len(self.all_feature)
         print(f"{self.train_val_test} split has {total_num} sequences.")
+
         now_history_frame = self.history_frames - 1
-        feature_id = list(range(0,5)) + [8] + [-2]
+
+        dyn_feature_id = list(range(0,5)) + [-4]  # Dynamic feats: x, y, heading, velx, vely, (type), mask  
+                                                        # Static_feats: intersection, stop_line, type
+
         self.track_info = self.all_feature[:,:,:,13:15]
         self.object_type = self.all_feature[:,:,now_history_frame,8].int()
-        self.scene_ids = self.all_feature[:,0,now_history_frame,-3].numpy()
+        self.scene_ids = self.all_feature[:,0,now_history_frame,-5].numpy()
         self.all_scenes = np.unique(self.scene_ids)
-        self.num_visible_object = self.all_feature[:,0,now_history_frame,-1].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
-        self.output_mask= self.all_feature[:,:,:,-2].unsqueeze_(-1)
+        self.num_visible_object = self.all_feature[:,0,now_history_frame,-3].int()   #Max=108 (train), 104(val), 83 (test)  #Challenge: test 20 ! train 33!
+        self.output_mask= self.all_feature[:,:,:,-4].unsqueeze_(-1)
+        
+        self.static_features = self.all_feature[:,:,now_history_frame,[8,-2,-1]]
+        # Creat indeces for the vocabulary
+        # self.static_features[:,:,-1] += 1
+        # self.static_features[:,:,-1][self.static_features[:,:,-1] == 1] = 0 not necessary because no yield only 0 / 1-5
+        # self.static_features[:,:,0] += 7
         '''
         for t in range(history_frames):
-            self.all_feature[:,:,t, 2] -=  self.all_feature[:,:,now_history_frame, 2] 
+            self.all_feature[:,:,t, 2] -=  se
+            lf.all_feature[:,:,now_history_frame, 2] 
         '''
         #rescale_xy[:,:,:,0] = torch.max(abs(self.all_feature[:,:,:,0]))  
         #rescale_xy[:,:,:,1] = torch.max(abs(self.all_feature[:,:,:,1]))  
@@ -205,7 +206,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         if self.local_frame:
             all_feature = self.all_feature.clone()
             for seq in range(self.all_feature.shape[0]):
-                index = torch.tensor( [ int(torch.nonzero(mask_i)[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-1]])
+                index = torch.tensor( [ int(torch.nonzero(mask_i)[0][0]) for mask_i in self.all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,-4]])
                 all_feature[seq,:self.num_visible_object[seq]-1,:self.history_frames,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,index[i]:self.history_frames,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], self.history_frames) for i in range(self.num_visible_object[seq]-1)])
                 # Convert ego feats
                 index = torch.nonzero(self.all_feature[seq, self.num_visible_object[seq]-1, :self.history_frames, 0])[0][0]
@@ -213,7 +214,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
                 
                 all_feature[seq,:self.num_visible_object[seq],self.history_frames:,:2] = torch.tensor([ convert_global_coords_to_local(self.all_feature[seq,i,self.history_frames:,:2], self.all_feature[seq,i,now_history_frame,:2], self.all_feature[seq,i,now_history_frame,2], -1) for i in range(self.num_visible_object[seq])])
             
-            self.node_features = all_feature[:,:,:now_history_frame,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+            self.node_features = all_feature[:,:,:now_history_frame,dyn_feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
             '''
             self.node_features[:,:,:,1] = (self.node_features[:,:,:,1] + 0.6967) / 2.8636
             self.node_features[:,:,:,0] = self.node_features[:,:,:,0] / 0.2077
@@ -225,12 +226,12 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             self.node_labels = all_feature[:,:,self.history_frames:,:2] 
         else:
             ###### Normalize with training statistics to have 0 mean and std=1 #######
-            self.node_features = self.all_feature[:,:,:self.history_frames,feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
+            self.node_features = self.all_feature[:,:,:self.history_frames,dyn_feature_id]   #xy mean -0.0047 std 8.44 | xyhead 0.002 6.9 | (0,8) 0.0007 4.27 | (0,5) 0.0013 5.398 (test 0.004 3.35)
             #self.node_features = (self.node_features) / 5 #(challenge 1.06) # 5 normal filetered
             self.node_labels = self.all_feature[:,:,self.history_frames:,:3] 
             self.node_labels[:,:,:,2:] = ( self.node_labels[:,:,:,2:] + 0.0015 ) / 1.2944    # Normalize heading for z0 loss.
         
-        self.global_features = self.all_feature[:,:,:,feature_id]
+        self.global_features = self.all_feature[:,:,:,dyn_feature_id]
         
         
     def __len__(self):
@@ -238,6 +239,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):         
         ### Create graph ###
+        self.all_adjacency[idx]
         graph = dgl.from_scipy(spp.coo_matrix(self.all_adjacency[idx][:self.num_visible_object[idx],:self.num_visible_object[idx]])).int()
         
         ### Edge Data ###
@@ -259,15 +261,17 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             graph.edata['w'] = F.softmax(torch.tensor(distances, dtype=torch.float32), dim=0)
 
         feats = self.node_features[idx, :self.num_visible_object[idx]]
+        static_feats = self.static_features[idx, :self.num_visible_object[idx]]
         gt = self.node_labels[idx, :self.num_visible_object[idx]]
-        output_mask = self.output_mask[idx, :self.num_visible_object[idx], self.history_frames:]
+        output_mask = self.output_mask[idx, :self.num_visible_object[idx]] if self.test else self.output_mask[idx, :self.num_visible_object[idx], self.history_frames:]
         sample_token=str(self.all_tokens[idx][0,1])
         scene_id = int(self.scene_ids[idx])
 
         ### Include ego in feats and labels
         feats[-1,:,-1] = 1
         output_mask[-1,:] = 1
-        ### Load Lanes in 50m radius for all agents in this sample
+
+        ### Load next lanes for all agents in this sample
         if self.retrieve_lanes:
             lanes = {sample_token: self.lanes[sample_token]}     
         else:
@@ -288,21 +292,23 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
         global_feats = self.global_features[idx,:self.num_visible_object[idx],:,:3]
         global_feats[:,:,:2] = global_feats[:,:,:2] + self.all_mean_xy[idx,:2]
 
-        ### Check if all feats == 0
-        if self.local_frame:
-            empty_agents= []
+        ### Check if all feats == 0, i.e. only data in current frame
+        """ if self.local_frame:
+            empty_agents = []
             for i,feat_i in enumerate(feats):
                 if not torch.any(feat_i):
                     empty_agents.append(i)
-            idx_with_data = list(set(range(len(feats))) - set(empty_agents))
-            feats = feats[idx_with_data] 
-            gt = gt[idx_with_data]
-            output_mask = output_mask[idx_with_data]   
-            global_feats = global_feats[idx_with_data]       
-            maps = maps[idx_with_data]
-            graph.remove_nodes(empty_agents)
-            tokens = tokens[idx_with_data]
-        
+            if len(empty_agents) != 0:
+                idx_with_data = list(set(range(len(feats))) - set(empty_agents))
+                feats = feats[idx_with_data] 
+                static_feats = static_feats[idx_with_data]
+                gt = gt[idx_with_data]
+                output_mask = output_mask[idx_with_data]   
+                global_feats = global_feats[idx_with_data]       
+                maps = maps[idx_with_data]
+                graph.remove_nodes(empty_agents)
+                tokens = tokens[idx_with_data]
+        """
         """
         ### SAVE HD_MAPS jpg
 
@@ -314,15 +320,15 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             cv2.imwrite(os.path.join(path,sample_token+f'agent_{i}.jpg'),cv2.cvtColor(img[i].transpose(1,2,0), cv2.COLOR_RGB2BGR))
         """
         
-        return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx]), tokens, self.all_mean_xy[idx,:2], global_feats, lanes
+        return graph, output_mask, feats, gt, maps, int(self.scene_ids[idx]), tokens, self.all_mean_xy[idx,:2], global_feats, lanes, static_feats
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='test', local_frame=False, retrieve_lanes=False, history_frames=5, step=1)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='train', local_frame=True, retrieve_lanes=False, history_frames=5, step=1)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
     test_dataloader=iter(DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_batch_ns) )
-    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps,  scene_id, tokens, mean_xy,  global_feats, lanes  in test_dataloader:
+    for batched_graph, masks, snorm_n, snorm_e, feats, gt, maps,  scene_id, tokens, mean_xy,  global_feats, lanes, static_feats  in test_dataloader:
         print(feats.shape, maps.shape, scene_id)
 
     

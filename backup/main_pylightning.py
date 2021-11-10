@@ -18,7 +18,7 @@ from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
 from models.GCN import GCN 
 from models.scout import SCOUT
 from models.SCOUT_MDN import SCOUT_MDN
-from models.scout_MTP_v2 import SCOUT_MTP
+from models.scout_MTP import SCOUT_MTP
 from models.Gated_MDN import Gated_MDN
 from models.Gated_GCN import GatedGCN
 from models.RGCN import RGCN
@@ -462,7 +462,7 @@ def main(args: Namespace):
 
 
     input_dim_model = input_dim*(history_frames -1) if args.local_frame else input_dim * history_frames #input_dim*(history_frames-1) if config.dataset=='apollo' else input_dim*history_frames
-    output_dim = (2*future_frames + 1) #if config.probabilistic == False else 5*future_frames
+    output_dim = (2*future_frames+ 1) if args.model_type == 'mtp' else 2*future_frames
 
     if args.model_type == 'gat_mdn':
         #hidden_dims = args.hidden_dims // args.heads
@@ -518,11 +518,11 @@ def main(args: Namespace):
                         local_frame = args.local_frame, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, wandb = not args.nowandb, num_modes=args.num_modes)  
         
         print('############ RESUME  ##############')
-        early_stop_callback = EarlyStopping('Sweep/val_class_loss', patience=10)
-        checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_class_loss', mode='min',  save_last=True, dirpath=os.path.join('/media/14TBDISK/sandra/logs/', ckpt_folder + '_resume'))
+        #early_stop_callback = EarlyStopping('Sweep/val_class_loss', patience=10)
+        #checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_class_loss', mode='min',  save_last=True, dirpath=os.path.join('/media/14TBDISK/sandra/logs/', ckpt_folder + '_resume'))
         
-        trainer = pl.Trainer(resume_from_checkpoint=args.ckpt, weights_summary='full',  logger=wandb_logger, gpus=args.gpus, deterministic=True, precision=16, callbacks=[early_stop_callback,checkpoint_callback], profiler=True) 
-        trainer.fit(LitGNN_sys)
+        #trainer = pl.Trainer(resume_from_checkpoint=args.ckpt, weights_summary='full',  logger=wandb_logger, gpus=args.gpus, deterministic=True, precision=16, callbacks=[early_stop_callback,checkpoint_callback], profiler=True) 
+        #trainer.fit(LitGNN_sys)
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler=True)
         trainer.test(LitGNN_sys)
@@ -546,7 +546,7 @@ if __name__ == '__main__':
     parser.add_argument("--lr2", type=float, default=1e-3, help="Adam: Base learning rate")
     parser.add_argument("--wd", type=float, default=0.01, help="Adam: weight decay")
     parser.add_argument("--batch_size", type=int, default=512, help="Size of the batches")
-    parser.add_argument("--hidden_dims", type=int, default=1024)
+    parser.add_argument("--hidden_dims", type=int, default=1768)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose model type / aggregation function.")
     parser.add_argument("--dataset", type=str, default='nuscenes', help="Choose dataset.",
                                         choices=['nuscenes', 'ind', 'apollo'])
@@ -559,7 +559,7 @@ if __name__ == '__main__':
     parser.add_argument("--feat_drop", type=float, default=0.)
     parser.add_argument("--attn_drop", type=float, default=0.4)
     parser.add_argument("--heads", type=int, default=2, help='Attention heads (GAT)')
-    parser.add_argument("--num_modes", type=int, default=8)
+    parser.add_argument("--num_modes", type=int, default=5)
     parser.add_argument("--alfa", type=float, default=0, help='Weighting factor of the overlap loss term')
     parser.add_argument("--beta", type=float, default=0, help='Weighting factor of the FDE loss term')
     parser.add_argument("--delta", type=float, default=.001, help='Delta factor in Huber Loss')

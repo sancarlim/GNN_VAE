@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_test
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 from models.VAE_GNN import VAE_GNN
 from models.VAE_GATED import VAE_GATED
 from models.scout import SCOUT
@@ -21,7 +21,7 @@ from utils import str2bool, compute_change_pos
 from nuscenes.eval.prediction.data_classes import Prediction
 import json
 from torchvision import transforms, utils
-from utils import convert_local_coords_to_global
+from nuscenes.prediction.helper import convert_local_coords_to_global
 from nuscenes import NuScenes
 from nuscenes.prediction import PredictHelper
 
@@ -32,10 +32,9 @@ future = 6
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames #2s of history + 6s of prediction
-input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
+input_dim_model = (history_frames-1)*6 +3#Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 + 1
 base_path = '/home/sandra/PROGRAMAS/DBU_Graph/NuScenes'
-NUM_MODES = 5
 
 DATAROOT = '/media/14TBDISK/nuscenes'
 nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
@@ -44,7 +43,6 @@ helper = PredictHelper(nuscenes)
 
 class LitGNN(pl.LightningModule):
     def __init__(self, model,  train_dataset, val_dataset, test_dataset, model_type, history_frames: int=3, future_frames: int=3, 
-                 lr: float = 1e-3, batch_size: int = 64, wd: float = 1e-1, beta: float = 0., delta: float = 1.,
                  rel_types: bool = False, scale_factor=1, ckpt: str = None):
         super().__init__()
         self.model= model
@@ -71,7 +69,7 @@ class LitGNN(pl.LightningModule):
         pass
     
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=1, shuffle=False, num_workers=12, collate_fn=collate_batch_test) 
+        return DataLoader(self.test_dataset, batch_size=1, shuffle=False, num_workers=12, collate_fn=collate_batch_ns) 
     
     def training_step(self, train_batch, batch_idx):
         pass
@@ -80,12 +78,16 @@ class LitGNN(pl.LightningModule):
         pass
          
     def test_step(self, test_batch, batch_idx):
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens_eval, scene_id, mean_xy, maps, global_feats = test_batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene_id, tokens_eval,mean_xy, global_feats, lanes, static_feats = test_batch
+
+        last_loc = feats[:,-1:,:2].detach().clone() if not hparams.local_frame else torch.zeros((feats.shape[0], 1, 2), device='cuda')
+        feats_vel, labels = compute_change_pos(feats, labels_pos[:,:,:2], hparams.local_frame)
+        if hparams.feats_deltas and not hparams.local_frame:
+            feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1) if hparams.local_frame else torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
-        #last_loc = feats[:,-1:,:2].detach().clone() 
-        #feats_vel, labels = compute_change_pos(feats,labels_pos, self.scale_factor)
-        #feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
-        
+        #reshape to have shape (B*V,T*C) [c1,c2,...,c6] and concatenate static_feats
+        feats_model = torch.cat((feats.contiguous().view(feats.shape[0],-1), static_feats),dim = -1)
+
         #last_loc = last_loc*self.rescale_xy       
         e_w = batched_graph.edata['w'].float()
         if not self.rel_types:
@@ -118,12 +120,12 @@ class LitGNN(pl.LightningModule):
                     self.challenge_predictions.append(pred.serialize())
 
         elif self.model_type == 'mtp':
-            pred = self.model(batched_graph, feats,e_w,snorm_n,snorm_e, maps)
+            pred = self.model(feats_model,e_w, maps, batched_graph)
             ##pred=pred.view(feats.shape[0],self.future_frames,-1)
             
-            mode_probs = pred[:, -NUM_MODES:].clone()
-            desired_shape = (pred.shape[0], NUM_MODES, -1, 2)
-            prediction_all_agents = pred[:, :-NUM_MODES].cpu().numpy().reshape(desired_shape)
+            mode_probs = pred[:, -hparams.num_modes:].clone()
+            desired_shape = (pred.shape[0], hparams.num_modes, -1, 2)
+            prediction_all_agents = pred[:, :-hparams.num_modes].cpu().numpy().reshape(desired_shape)
             
             for j in range(1,labels_pos.shape[1]):
                 prediction_all_agents[:,:,j,:] = np.sum(prediction_all_agents[:,:, j-1:j+1,:],axis=-2) 
@@ -134,10 +136,11 @@ class LitGNN(pl.LightningModule):
                     self.cnt += 1
                     if self.cnt == 1368:
                         print('stop')
-                    idx = np.where(np.array(tokens_eval)== token[0])[0][0]
-                    instance, sample = token
+                    idx = np.where(np.array(tokens_eval) == token[0])[0][0]
+                    instance, sample = token[:2]
                     annotation = helper.get_sample_annotation(instance, sample)
                     prediction = prediction_all_agents[idx, :]
+                    #helper.get_future_for_agent(instance, sample, seconds=6, in_agent_frame=False)
                     for i, pred in enumerate(prediction):
                         prediction[i] =  convert_local_coords_to_global(pred,  annotation['translation'], annotation['rotation'])
                     #labels = global_feats[idx,history_frames:,:2].cpu().numpy() + mean_xy
@@ -186,7 +189,7 @@ def main(args: Namespace):
     print(args)
 
     test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, 
-                        future_frames=future_frames, challenge_eval=True)  #25 seq 2 scenes 103, 916
+                        future_frames=future_frames)  #25 seq 2 scenes 103, 916
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
@@ -200,8 +203,8 @@ def main(args: Namespace):
                         ew_dims=args.ew_dims, backbone=args.backbone)
     elif args.model_type == 'mtp':
         model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone,
-                        num_modes = NUM_MODES)
+                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone,
+                        num_modes = args.num_modes, emb_dim=args.emb_dims, history_frames=history_frames)
     else:
         model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, bn=(args.norm=='bn'), gn=(args.norm=='gn'),
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone, freeze=args.freeze)
@@ -209,7 +212,7 @@ def main(args: Namespace):
     LitGNN_sys = LitGNN(model=model, history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
                  test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, model_type = args.model_type)
       
-    trainer = pl.Trainer(gpus=args.gpus, deterministic=True, precision=16) 
+    trainer = pl.Trainer(gpus=args.gpus, deterministic=True, precision=32) 
  
     LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, history_frames=history_frames, future_frames= future_frames,
                     train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor,
@@ -226,10 +229,11 @@ if __name__ == '__main__':
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
     parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=25, help="Dimensionality of the latent space")
-    parser.add_argument("--hidden_dims", type=int, default=512)
+    parser.add_argument("--hidden_dims", type=int, default=768)
+    parser.add_argument("--emb_dims", type=int, default=512)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
                                         choices=['vae_gat', 'vae_gated', 'vae_prior','scout', 'mtp'])
-    parser.add_argument('--freeze', type=int, default=7, help="Layers to freeze in resnet18.")
+    parser.add_argument('--freeze', type=int, default=8, help="Layers to freeze in resnet18.")
     parser.add_argument("--norm", type=str, default=None, help="Wether to apply BN (bn) or GroupNorm (gn).")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--feat_drop", type=float, default=0.)
@@ -238,8 +242,11 @@ if __name__ == '__main__':
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default=None, help='ckpt path.')   
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')
-    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
-                                        choices=['resnet_gray', 'mobilenet', 'resnet18', 'resnet50', 'map_encoder'])
+    parser.add_argument("--backbone", type=str, default='resnet34', help="Choose CNN backbone.",
+                                        choices=['resnet_gray', 'mobilenet', 'resnet18','resnet34', 'resnet50', 'map_encoder'])
+    parser.add_argument('--local_frame',  type=str2bool, nargs='?', const=True, default=True, help='whether to use local or global features.') 
+    parser.add_argument('--feats_deltas',  type=str2bool, nargs='?', const=True, default=True, help='whether to use position deltas as features.')  
+    parser.add_argument("--num_modes", type=int, default=10) 
     
     
     hparams = parser.parse_args()

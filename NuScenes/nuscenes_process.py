@@ -1,5 +1,6 @@
 import sys
 import os
+from matplotlib.pyplot import axis
 import numpy as np
 from numpy.core.fromnumeric import mean
 from scipy import spatial 
@@ -28,12 +29,12 @@ from nuscenes.prediction.input_representation.combinators import Rasterizer
 scene_blacklist = [992]
 
 max_num_objects = 70  #pkl np.arrays with same dimensions
-total_feature_dimension = 16 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects
+total_feature_dimension = 18 #x,y,heading,vel[x,y],acc[x,y],head_rate, type, l,w,h, frame_id, scene_id, mask, num_visible_objects
 
 FREQUENCY = 2
 dt = 1 / FREQUENCY
-history = 2
-future = 6
+history = 4
+future = 5
 history_frames = history*FREQUENCY 
 future_frames = future*FREQUENCY
 total_frames = history_frames + future_frames + 1 #2s of history + 6s of prediction
@@ -56,6 +57,15 @@ transform = transforms.Compose(
                                 #transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
                             ]
                         )
+
+mapping_dict = {
+            'YIELD':1,
+            'STOP_SIGN':2,
+            'PED_CROSSING':3, #truck_bus
+            'TURN_STOP':4,
+            'TRAFFIC_LIGHT': 5
+        }
+    
 
 
 #DEFINE ATTENTION RADIUS FOR CONNECTING NODES
@@ -283,11 +293,11 @@ def process_tracks(tracks, start_frame, end_frame, current_frame, nusc_map):
     ############ SECOND OPTION ###############
     object_feature_list = []
     while start_frame < 0:
-        object_feature_list.append(np.zeros(shape=(num_visible_object,total_feature_dimension)))
+        object_feature_list.append(np.zeros(shape=(num_visible_object,total_feature_dimension-2)))
         start_frame += 1
     
     #now_all_object_id = set([val for frame in range(start_frame, end_frame) for val in tracks[frame]["node_id"]])  #todos los obj en los15 hist frames
-
+    
     for frame_ind in range(start_frame, end_frame + 1):	
         now_frame_feature_dict = {node_id : (
             list(tracks[frame_ind]['position'][np.where(np.array(tracks[frame_ind]['node_id'])==node_id)[0][0]] - mean_xy)+ 
@@ -297,27 +307,45 @@ def process_tracks(tracks, start_frame, end_frame, current_frame, nusc_map):
             [1] + [num_visible_object]  #mask is 0 for ego
             ) for node_id in tracks[frame_ind]["node_id"] if node_id in visible_node_id_list}
         # if the current object is not at this frame, we return all 0s 
-        now_frame_feature = np.array([now_frame_feature_dict.get(vis_id, np.zeros(total_feature_dimension)) for vis_id in visible_node_id_list])
-        ego_feature = np.array((list(tracks[frame_ind]['position'][-1] - mean_xy) + list(tracks[frame_ind]['motion'][-1]) + list(tracks[frame_ind]['info_agent'][-1]) + list(tracks[frame_ind]['info_sequence'][-1]) + [0] + [num_visible_object])).reshape(1, total_feature_dimension)
+        now_frame_feature = np.array([now_frame_feature_dict.get(vis_id, np.zeros(total_feature_dimension-2)) for vis_id in visible_node_id_list])
+        ego_feature = np.array((list(tracks[frame_ind]['position'][-1] - mean_xy) + list(tracks[frame_ind]['motion'][-1]) + list(tracks[frame_ind]['info_agent'][-1]) + list(tracks[frame_ind]['info_sequence'][-1]) + [0] + [num_visible_object])).reshape(1, total_feature_dimension-2)
         now_frame_feature = np.vstack((now_frame_feature, ego_feature))
         object_feature_list.append(now_frame_feature)
         
         if frame_ind == current_frame:
             lanes = []
+            static_feats = []
             for v in now_frame_feature:
                 if v[8]!=2:
-                    lanes.append(nusc_map.get_closest_lane(v[0] + mean_xy[0], v[1] + mean_xy[1], radius=2))
+                    x = v[0] + mean_xy[0]
+                    y = v[1] + mean_xy[1]
+                    lanes.append(nusc_map.get_closest_lane(x, y, radius=2))
+                    #road_segment = nusc_map.get_next_roads(x, y)['road_segment'][0]
+                    layers = nusc_map.layers_on_point(x, y)
+                    stop_token = layers['stop_line']
+                    
+                    is_intersection = 0
+                    if len(layers['road_segment']) != 0:
+                        is_intersection = int(nusc_map.get('road_segment',layers['road_segment'])['is_intersection'])
+                    
+                    stop_type = 0
+                    if len(stop_token) != 0:
+                        stop_type = mapping_dict[nusc_map.get('stop_line',stop_token)['stop_line_type']]
+                    
+                    static_feats.append(np.array([is_intersection, stop_type])) 
                 else:
+                    static_feats.append(np.array([-1,-1]))
                     lanes.append('-1')
 
-    
-    object_feature_list = np.array(object_feature_list)  # T,V,C
-    if object_feature_list.shape[1] > 50:
-        print(object_feature_list.shape[1])
-    assert object_feature_list.shape[0] == total_frames
+     
+    object_feature = np.concatenate((np.array(object_feature_list), np.expand_dims(np.array(static_feats),0).repeat(len(object_feature_list), axis=0)), axis=-1)   # T,V,C
+    if object_feature.shape[1] > 50:
+        print(object_feature.shape[1])
+    assert object_feature.shape[0] == total_frames
     object_frame_feature = np.zeros((max_num_objects, total_frames, total_feature_dimension))  # V, T, C
-    object_frame_feature[:num_visible_object] = np.transpose(object_feature_list, (1,0,2))
-    inst_sample_tokens = np.column_stack((tracks[current_frame]['node_id'], tracks[current_frame]['sample_token'], np.array(lanes)))
+    object_frame_feature[:num_visible_object] = np.transpose(object_feature, (1,0,2))
+    inst_sample_tokens = np.stack((tracks[current_frame]['node_id'], tracks[current_frame]['sample_token'],
+                         np.array(lanes)), axis=-1) 
     #visible_object_indexes = [list(now_all_object_id).index(i) for i in visible_node_id_list]
     return object_frame_feature, neighbor_matrix, mean_xy, inst_sample_tokens
 
@@ -365,11 +393,11 @@ def process_scene(scene):
             else:
                 attribute = [None]
             
-            if 'pedestrian' in category and not 'stroller' in category and not 'wheelchair' in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
+            if 'pedestrian' in category and 'stroller' not in category and 'wheelchair' not in category and 'sitting_lying_down' not in attribute and 'standing' not in attribute:
                 node_type = 2
-            elif 'bicycle' in category or 'motorcycle' in category and 'without_rider' not in attribute and 'parked' not in attribute and 'stopped' not in attribute:
+            elif ('bicycle' in category or 'motorcycle' in category) and 'object' not in category and 'without_rider' not in attribute and 'parked' not in attribute and 'stopped' not in attribute:
                 node_type = 3
-            elif 'vehicle' in category and 'parked' not in attribute and 'stopped' not in attribute:                 
+            elif 'vehicle' in category and not ('bicycle' in category or 'motorcycle' in category) and 'parked' not in attribute and 'stopped' not in attribute:                 
                 node_type = 1
             else:
                 continue
@@ -539,7 +567,7 @@ for data_class in ['train', 'val', 'test']:
         #if scene_id in scene_blacklist:  # Some scenes have bad localization
         #    continue
         
-        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene', scene_token))
+        all_feature_sc, all_adjacency_sc, all_mean_sc, tokens_sc = process_scene(nuscenes.get('scene',scene_token))
         
         print(f"Scene {nuscenes.get('scene', scene_token)['name']} processed!")# {all_adjacency_sc.shape[0]} sequences of 8 seconds.")
 
@@ -553,7 +581,7 @@ for data_class in ['train', 'val', 'test']:
     all_adjacency = np.array(all_adjacency) 
     all_mean_xy = np.array(all_mean_xy) 
     all_tokens = np.array(all_tokens)
-    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_2s6s_' + data_class + '.pkl'
+    save_path = '/media/14TBDISK/sandra/nuscenes_processed/ns_4s_' + data_class + '.pkl'
     with open(save_path, 'wb') as writer:
         pickle.dump([all_data, all_adjacency, all_mean_xy, all_tokens], writer)
     print(f'Processed {all_data.shape[0]} sequences and {len(scenes_token_set)} scenes.')

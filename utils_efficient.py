@@ -13,10 +13,16 @@ from nuscenes.map_expansion import arcline_path_utils
 from nuscenes.prediction import PredictHelper
 from nuscenes.prediction.input_representation.static_layers import load_all_maps
 from scipy import interpolate
-import pandas as pd 
+from nuscenes.nuscenes import NuScenes
+from nuscenes.prediction import PredictHelper
+import pandas as pd
 
+'''
 DATAROOT = '/media/14TBDISK/nuscenes'
-
+ONEOVERSQRT2PI = 1.0 / math.sqrt(2*math.pi)
+nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
+helper = PredictHelper(nuscenes)
+'''
 
 
 def get_closest_lane(x: float, y: float, radius: float = 5, discrete_points: dict = None) -> str:
@@ -66,6 +72,7 @@ class MTPLoss:
     def __init__(self,
                  num_modes: int,
                  regression_loss_weight: float = 1.,
+                 offroad_loss_weight = 1.,
                  angle_threshold_degrees: float = 5.):
         """
         Inits MTP loss.
@@ -78,7 +85,9 @@ class MTPLoss:
         self.num_modes = num_modes
         self.num_location_coordinates_predicted = 2  # We predict x, y coordinates at each timestep.
         self.regression_loss_weight = regression_loss_weight
+        self.offroad_loss_weight = offroad_loss_weight
         self.angle_threshold = angle_threshold_degrees
+        #self.off_road_loss = OffRoadRate(helper)
 
     def _get_trajectory_and_modes(self,
                                   model_prediction: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -160,18 +169,18 @@ class MTPLoss:
     def _compute_ave_l2_norms(tensor: torch.Tensor, mask: torch.Tensor) -> float:
         """
         Compute the average of l2 norms of each row in the tensor.
-        :param tensor: Shape [1, n_timesteps, 2].
+        :param tensor: Shape [N_batch, n_timesteps, 2].
         :return: Average l2 norm. Float.
         """
         # Don't take into account frames without gt.
-        l2_norms = torch.norm(tensor[:,:mask.nonzero()[-1]+1], p=2, dim=2)
-        avg_distance = torch.mean(l2_norms)
-        return avg_distance.item()
+        l2_norms = torch.norm(tensor.squeeze(), p=2, dim=2)    #(tensor[:,:mask.nonzero()[-1]+1], p=2, dim=2)
+        avg_distance = torch.mean(l2_norms, dim=-1)   #(l2_norms)
+        return avg_distance   #.item()
 
     
         
     @staticmethod
-    def _get_lane_pos(  current_sample: str,
+    def get_lane_pos(   tokens: str,
                         instance_lanes: List[str],
                         trajectories: torch.Tensor,
                         current_angle: torch.Tensor) -> List[Tuple[float, int]]:
@@ -182,27 +191,22 @@ class MTPLoss:
         #if current_lane == '':
         #    print('NO current lane !')
         #current_lane_record = nusc_map.get_arcline_path(current_lane)
-
-        # NOTE:
-        # Op 3. Only for test if too slown
-        # Op 2. for each t
-        # Op 1. for last t and use lanes to get the trajectory. SI sigue en la misma lane ya tienes la traj.
-
+        
         # Iterate over N modes
         n_modes_poses = []
-        for traj in trajectories:
-            lane = get_closest_lane(traj[-1,0].item(), traj[-1,1].item(), radius=2, discrete_points=instance_lanes)
+        for n, traj in enumerate(trajectories):
+            lane = get_closest_lane(traj[-1,0].item(), traj[-1,1].item(), radius=2, discrete_points=instance_lanes[tokens[n,1]][tokens[n,0]])
             if lane != '':
                 #lane_record = nusc_map.get_arcline_path(lane)
                 poses_on_lane = torch.cuda.FloatTensor([ project_pose_to_lane((traj[i,0].item(), traj[i,1].item(), current_angle), instance_lanes[lane])[:2] for i in range(traj.shape[0]) ])
-                # layers = nusc_map.layers_on_point(traj[0,0], traj[0,1])
+                # layers = nusc_map.layers_on_point(traj[0,0], traj[0,1])  #stop_line, walkway, ped_crossing.
                 # if layers['road_segment'] != '':
                 #   if nusc_map.get('road_segment', layers['road_segment'])['is_intersection']:
                 # nusc_map.get_next_roads(traj[0,0], traj[0,1])
                 # out_lanes = nusc_map.get_outgoing_lane_ids(current_lane)
                 n_modes_poses.append(poses_on_lane)
             else:
-                print(f'NO lane! Sample: {current_sample}')
+                print(f'NO lane! Sample: {tokens[n,1]}')
                 return trajectories
         
         return n_modes_poses
@@ -272,7 +276,7 @@ class MTPLoss:
 
 
     def __call__(self, predictions: torch.Tensor, types: torch.Tensor, targets: torch.Tensor, last_loc: torch.Tensor, mask: torch.Tensor, 
-                    local_frame: bool, tokens: np.array, lanes: np.array, global_feats: torch.Tensor, test: bool = False) -> torch.Tensor:
+                    local_frame: bool, tokens: np.array, lanes: np.array, global_feats: torch.Tensor, val_test: str = 'train') -> torch.Tensor:
         """
         Computes the MTP loss on a batch.
         The predictions are of shape [batch_size, n_ouput_neurons of last linear layer]
@@ -283,11 +287,11 @@ class MTPLoss:
         :return: zero-dim tensor representing the loss on the batch.
         """
 
-        batch_losses = torch.cuda.FloatTensor()
-        class_losses = torch.cuda.FloatTensor()
-        regression_losses = torch.cuda.FloatTensor()
-        if test:
-            best_trajs = torch.cuda.FloatTensor()
+        # batch_losses = torch.cuda.FloatTensor()
+        # class_losses = torch.cuda.FloatTensor()
+        # regression_losses = torch.cuda.FloatTensor()
+        # if test:
+        #     best_trajs = torch.cuda.FloatTensor()
 
         if len(predictions.shape) == 2:
             trajectories, modes = self._get_trajectory_and_modes(predictions)
@@ -295,10 +299,10 @@ class MTPLoss:
             trajectories = predictions[:,:,:-1].clone().view(targets.shape[0], self.num_modes, -1, self.num_location_coordinates_predicted)
             modes = predictions[:,:,-1].clone().transpose(1,0)
         
-        if test:
+        if lanes != -1 or val_test != 'train':
             for j in range(1,targets.shape[-2]):
                 trajectories[:,:,j,:] = torch.sum(trajectories[:,:,j-1:j+1,:],dim=-2) 
-            trajectories += last_loc
+            #trajectories += last_loc
 
         '''
         if not local_frame:
@@ -308,24 +312,56 @@ class MTPLoss:
             trajectories += last_loc
         '''    
         targets = targets * mask 
-        current_location = tokens[0,-1]
-        #nusc_map = NuScenesMap(map_name=current_location, dataroot=DATAROOT) 
+        
+        
+        losses = torch.cuda.FloatTensor() #torch.Tensor().requires_grad_(not test).to(trajectories.device)
+        # Iterate over modes
+        for mode in range(trajectories.shape[1]):
+            error = self._compute_ave_l2_norms(targets - trajectories[:,mode:mode+1]*mask, mask) #BV
+            losses = torch.cat((losses, error.unsqueeze(0)), 0) #(NUM_MODES, BV)
 
+        with torch.no_grad():
+            best_mode = torch.argmin(losses, dim=0)
+
+        best_trajs = trajectories[torch.arange(targets.shape[0]),best_mode]*mask.squeeze(1)
+        if val_test == 'test':
+            return best_trajs
+
+        regression_loss = f.smooth_l1_loss(best_trajs, targets.squeeze())
+        #  torch.sum(torch.where(torch.abs(targets.squeeze()-best_trajs) < delta , (0.5*(targets.squeeze()-best_trajs)**2), torch.abs(targets.squeeze() - best_trajs)*delta - 0.5*(delta**2)), dim=-1) 
+        classification_loss = f.cross_entropy(modes, best_mode)
+        
+        best_trajs = convert_local_coords_to_global(best_trajs, global_feats[:,:2], global_feats[:,2])
+        
+        if val_test == 'train':
+
+            off_road_rate = 0 #self.off_road_loss(best_trajs,  tokens[:,-1])
+            return classification_loss + self.regression_loss_weight * regression_loss + self.offroad_loss_weight * off_road_rate, regression_loss, classification_loss, off_road_rate
+        
+        else:   
+
+            if lanes != -1:
+                trajectories_lanes = torch.cuda.FloatTensor(self.get_lane_pos(current_sample=tokens[:,1], trajectories = trajectories, 
+                                    current_angle = global_feats[:,2], instance_lanes = lanes)) #current_lane = tokens[batch_idx,-2]
+
+            return best_trajs, regression_loss, classification_loss
+
+        """ 
         for batch_idx in range(targets.shape[0]): #-1 to not take into account ego
             ###trajs = [ convert_local_coords_to_global(trajectory, global_feats[batch_idx,:2], global_feats[batch_idx,2]) for trajectory in trajectories[batch_idx] ]
                  
             if not mask[batch_idx].squeeze().any():
                 if test:
-                    traj =  convert_local_coords_to_global(trajectories[0], global_feats[batch_idx,:2], global_feats[batch_idx,2])
-                    best_trajs = torch.cat((best_trajs, traj.unsqueeze(0)), 0)
+                    best_trajs = torch.cat((best_trajs, trajectories[batch_idx][0].unsqueeze(0)), 0)
                 continue
             
-            if types[batch_idx] == 1 and lanes is not -1:
-                """ if tokens[batch_idx,-1] != current_location:
-                    current_location = tokens[batch_idx,-1]
-                    nusc_map = NuScenesMap(map_name=current_location, dataroot=DATAROOT) """
 
-                trajectories[batch_idx] = self._get_lane_pos(current_sample=tokens[batch_idx,1], trajectories = trajectories[batch_idx], current_angle = global_feats[batch_idx,2], instance_lanes = lanes[tokens[batch_idx,1]][tokens[batch_idx,0]]) #current_lane = tokens[batch_idx,-2]
+            if types[batch_idx] != 2 and lanes != -1:
+                # if tokens[batch_idx,-1] != current_location:
+                #     current_location = tokens[batch_idx,-1]
+                #     nusc_map = NuScenesMap(map_name=current_location, dataroot=DATAROOT) 
+
+                trajectories[batch_idx] = torch.cuda.FloatTensor(self.get_lane_pos(current_sample=tokens[batch_idx,1], trajectories = trajectories[batch_idx], current_angle = global_feats[batch_idx,2], instance_lanes = lanes[tokens[batch_idx,1]][tokens[batch_idx,0]])) #current_lane = tokens[batch_idx,-2]
                 
             '''
             angles = self._compute_angles_from_ground_truth(target=targets[batch_idx],
@@ -349,14 +385,13 @@ class MTPLoss:
 
             distances_from_ground_truth = sorted(distances_from_ground_truth)
             #distances_lanes_gt = sorted(distances_lanes)
-            #COGER LA MEJOR TRAJ 
+            #USAR LA MEJOR TRAJ 
             best_mode = distances_from_ground_truth[0][1]
 
             best_mode_trajectory = trajectories[batch_idx][best_mode].unsqueeze(0) * mask[batch_idx]
 
             if test:
-                traj = convert_local_coords_to_global(best_mode_trajectory.squeeze(), global_feats[best_mode,:2], global_feats[best_mode,2])
-                best_trajs = torch.cat((best_trajs, traj), 0)
+                best_trajs = torch.cat((best_trajs, best_mode_trajectory), 0)
                 continue
             
             regression_loss = f.smooth_l1_loss(best_mode_trajectory, targets[batch_idx])
@@ -372,15 +407,15 @@ class MTPLoss:
             regression_losses = torch.cat((regression_losses, regression_loss.unsqueeze(0)), 0) 
             #trajs_lanes_all = torch.cat((trajs_lanes_all, best_mode_trajectory), 0)
 
-        
+        if test:
+            return best_trajs
+
         avg_loss = torch.mean(batch_losses)
         regression_avg_loss = torch.mean(regression_losses)
         class_avg_loss = torch.mean(class_losses)
 
-        if test:
-            return best_trajs, regression_loss, class_avg_loss
-
-        return avg_loss, regression_avg_loss, class_avg_loss 
+        return avg_loss, regression_avg_loss, class_avg_loss  
+        """
 
 
 
@@ -435,8 +470,8 @@ def compute_change_pos(feats,gt, local_frame):
 
 
 def compute_long_lat_error(pred,gt,mask):
-    pred = pred*mask #B*V,T,C  (B n grafos en el batch)
-    gt = gt*mask  # outputmask BV,T,C
+    pred = pred*mask
+    gt = gt*mask  
     lateral_error = pred[:,:,0]-gt[:,:,0]
     long_error = pred[:,:,1] - gt[:,:,1]  
     overall_num = mask.sum(dim=-1).type(torch.int) 
@@ -448,9 +483,12 @@ def make_2d_rotation_matrix(angle_in_radians: float) -> np.ndarray:
     Makes rotation matrix to rotate point in x-y plane counterclockwise
     by angle_in_radians.
     """
-
-    return torch.tensor([[torch.cos(angle_in_radians), -torch.sin(angle_in_radians)],
+    if len(angle_in_radians.shape) == 0:
+        return torch.tensor([[torch.cos(angle_in_radians), -torch.sin(angle_in_radians)],
                      [torch.sin(angle_in_radians), torch.cos(angle_in_radians)]], device=angle_in_radians.device)
+    else:
+        return torch.cat([torch.tensor([[torch.cos(angle), -torch.sin(angle)],
+                     [torch.sin(angle), torch.cos(angle)]], device=angle_in_radians.device).unsqueeze(0) for angle in angle_in_radians ], dim=0)
 
 
 def angle_of_rotation(yaw: float) -> float:
@@ -504,8 +542,12 @@ def convert_local_coords_to_global(coordinates: np.ndarray,
     yaw = angle_of_rotation(yaw) #angle_of_rotation(quaternion_yaw(Quaternion(rotation)))
 
     transform = make_2d_rotation_matrix(angle_in_radians=-yaw)
+    if len(yaw.shape) != 0:
+        return torch.matmul(transform, coordinates.transpose(2,1)).transpose(2,1) + torch.atleast_2d(translation.unsqueeze(1))
+    else:
+        return torch.matmul(transform, coordinates.T).T[:, :2] + torch.atleast_2d(translation[:2])
 
-    return torch.matmul(transform, coordinates.T).T[:, :2] + torch.atleast_2d(translation[:2])
+
 
 
 class OffRoadRate:
@@ -565,7 +607,7 @@ class OffRoadRate:
             x_interpolated, y_interpolated = interpolate.splev(np.linspace(0, 1, number_of_points), knots)
             return x_interpolated, y_interpolated
 
-    def __call__(self, prediction: torch.tensor, map_names: List[str]) -> torch.tensor:
+    def __call__(self, prediction: torch.tensor, map_names: str) -> torch.tensor:
         """
         Computes the fraction of modes in prediction that are not entirely contained in the drivable area.
         :param prediction: Model prediction. [modes, N, T, 2]
@@ -573,29 +615,30 @@ class OffRoadRate:
             drivable area.
         """
         ###     map_name = self.helper.get_map_name_from_sample_token(sample_token)
-
         # Get indeces by map grouping
-        indices_by_map = pd.Series(range(len(map_names))).groupby(map_names, sort=False).apply(list).tolist()
+        group_by_map = pd.Series(range(len(map_names))).groupby(map_names, sort=False).apply(list)  #.tolist()
 
-        drivable_areas = [self.drivable_area_polygons[map_name] for map_name in set(map_names)]
-        max_row, max_col = [drivable_area.shape for drivable_area in drivable_areas]
-
+        drivable_areas = [torch.tensor(self.drivable_area_polygons[map_name], device=prediction.device) for map_name in group_by_map.keys()]
+        max_row_col = [drivable_area.shape for drivable_area in drivable_areas]
 
         n_violations = 0
-        for mode in prediction:
-            # Fit a cubic spline to the trajectory and interpolate with 200 points
-            #x_interpolated, y_interpolated = self.interpolate_path(mode, self.number_of_points)
+        #for mode in prediction:
+        for i, row_col in enumerate(max_row_col):
+            # Fit a cubic spline to the trajectory and interpolate with 200 points. IF pred time steps <= 3 returns pred
+            # x_interpolated, y_interpolated = self.interpolate_path(prediction[0].detach().cpu().numpy(), self.number_of_points)
 
             # x coordinate -> col, y coordinate -> row
             # Mask has already been flipped over y-axis
-            index_row = (mode[:,1] * self.pixels_per_meter).astype("int")
-            index_col = (mode[:,0] * self.pixels_per_meter).astype("int")
 
-            row_out_of_bounds = np.any(index_row >= max_row) or np.any(index_row < 0)
-            col_out_of_bounds = np.any(index_col >= max_col) or np.any(index_col < 0)
-            out_of_bounds = row_out_of_bounds or col_out_of_bounds
-            
-            if out_of_bounds or not np.all(drivable_area[index_row, index_col]):
-                n_violations += 1
+            index_row = (prediction[group_by_map.values[i],:,1] * self.pixels_per_meter).type(torch.LongTensor)
+            index_col = (prediction[group_by_map.values[i],:,0] * self.pixels_per_meter).type(torch.LongTensor)
+
+            row_out_of_bounds = torch.logical_or(torch.any(index_row >= row_col[0],1) , torch.any(index_row < 0,1))
+            col_out_of_bounds = torch.logical_or(torch.any(index_col >= row_col[1],1) , torch.any(index_col < 0,1))
+
+            out_of_bounds = torch.logical_or(row_out_of_bounds , col_out_of_bounds)
+            out_of_road = torch.all(drivable_areas[i][index_row, index_col], axis=1)
+        
+            n_violations += out_of_bounds.sum() + out_of_road.sum()
 
         return n_violations / prediction.shape[0]

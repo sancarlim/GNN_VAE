@@ -14,7 +14,7 @@ import math
 from torch.utils.data import DataLoader
 import torchvision
 from torchsummary import summary
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 
 
 class MDN(nn.Module):

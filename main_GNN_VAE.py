@@ -20,7 +20,6 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from argparse import ArgumentParser, Namespace
-import math
 from torch.distributions.kl import kl_divergence
 from torch.distributions.normal import Normal
 from utils import compute_change_pos, str2bool
@@ -185,8 +184,6 @@ class LitGNN(pl.LightningModule):
         
         ade = []
         fde = []         
-        #En test batch=1 secuencia con n agentes
-        #Para el most-likely coger el modo con pi mayor de los 3 y o bien coger muestra de la media 
         for i in range(10): # @top10 Saco el min ADE/FDE por escenario tomando 15 muestras (15 escenarios)
             #Model predicts relative_positions
             preds = self.model.inference(batched_graph, feats,e_w,snorm_n,snorm_e)

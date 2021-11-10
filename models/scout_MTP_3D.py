@@ -9,12 +9,12 @@ import torch.nn.functional as F
 import os
 os.environ['DGLBACKEND'] = 'pytorch'
 from torch.utils.data import DataLoader
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch, collate_batch_test
 from torchvision.models import resnet18
 from torchsummary import summary
 from models.MapEncoder import My_MapEncoder, ResNet18, ResNet50
 from models.backbone import MobileNetBackbone, ResNetBackbone, calculate_backbone_feature_dim
-from utils import MTPLoss
+import utils
 from nuscenes.nuscenes import NuScenes
 from nuscenes.prediction import PredictHelper
 
@@ -140,10 +140,10 @@ class GATConv(nn.Module):
                 return rst
 
 
-class My_GATLayer(nn.Module):
-    def __init__(self, in_feats, out_feats, e_dims, relu=True, feat_drop=0., attn_drop=0., att_ew=False, res_weight=True, res_connection=True):
-        super(My_GATLayer, self).__init__()
-        self.linear_self = nn.Linear(in_feats, out_feats, bias=False)
+class GATLayer3D(nn.Module):
+    def __init__(self, in_channels, out_channels, e_dims, relu=True, feat_drop=0., attn_drop=0., att_ew=False, res_weight=True, res_connection=True):
+        super(GATLayer3D, self).__init__()
+        self.linear_self = nn.Conv2d(in_channels, out_channels, bias=False)
         self.linear_func = nn.Linear(in_feats, out_feats, bias=False)
         self.att_ew=att_ew
         self.relu = relu
@@ -160,7 +160,7 @@ class My_GATLayer(nn.Module):
       
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
-        gain = torch.nn.init.calculate_gain('linear', param=None)
+        gain = torch.nn.init.calculate_gain('linear', param=None)  #relu
         nn.init.xavier_normal_(self.linear_self.weight, gain)
         nn.init.xavier_normal_(self.linear_func.weight, gain)
         ##nn.init.kaiming_normal_(self.linear_self.weight, a=0.2, nonlinearity='leaky_relu')
@@ -187,10 +187,9 @@ class My_GATLayer(nn.Module):
         h = h_s + torch.sum(a * nodes.mailbox['z'], dim=1)
         return {'h': h}
                                
-    def forward(self, g, h, ew):
+    def forward(self, g, h):
         with g.local_scope():
             h_in = h.clone()
-            g.edata['w']  = ew 
             g.ndata['h']  = h 
             #feat dropout
             h=self.feat_drop_l(h)
@@ -269,7 +268,7 @@ class SCOUT_MTP(nn.Module):
             '''
 
         elif backbone == 'mobilenet':       
-            feature_extractor = MobileNetBackbone('mobilenet_v2', freeze = freeze)  #returns [n,1280] # 18 layers
+            self.feature_extractor = MobileNetBackbone('mobilenet_v2', freeze = freeze)  #returns [n,1280] # 18 layers
             #self.hidden_dim = hidden_dim + 1280
 
         elif backbone == 'resnet18':       
@@ -292,7 +291,6 @@ class SCOUT_MTP(nn.Module):
 
         else:
             feature_extractor = None
-            emb_dim = hidden_dim
 
         backbone_feature_dim = calculate_backbone_feature_dim(feature_extractor, input_shape = (3,224,224)) if backbone != 'None' else 0
         '''
@@ -309,7 +307,8 @@ class SCOUT_MTP(nn.Module):
             embedding_h = nn.Linear(input_dim, emb_dim)
             encode_h = PositionalEncoding(emb_dim, dropout)
         else:
-            embedding_h = nn.Linear(input_dim, emb_dim) #nn.Embedding(11, emb_dim)
+            embedding_h = nn.Linear(7, emb_dim)
+            conv_h = nn.Conv1d(7, 16, kernel_size=2)
 
         linear_cat = nn.Linear(emb_dim + backbone_feature_dim, hidden_dim)
         self.hidden_dim = hidden_dim
@@ -344,6 +343,7 @@ class SCOUT_MTP(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.1) 
         self.embeddings = nn.ModuleDict({
             'embedding_h': embedding_h,
+            'conv_h'     : conv_h,
             'map_encoder': feature_extractor,
             'linear_cat': linear_cat
         })
@@ -398,27 +398,24 @@ class SCOUT_MTP(nn.Module):
         y=self.forward(g, feats, e_w, snorm_n, snorm_e, maps)
         return y
 
-    def forward(self, feats,e_w, maps, g, attr=False):
-        # For attributions (explain.py)
-        if attr:
-            g2 = g
-            g = dgl.batch((g, g2))
-
+    def forward(self, g, feats,e_w, maps):
         # Input embedding
         if self.emb_type =='gru':
-            h_enc = self.embeddings['encode_h'](F.selu(self.embeddings['embedding_h'](feats)))[1].squeeze(dim=0)
+            h_enc = self.embeddings['encode_h'](F.elu(self.embeddings['embedding_h'](feats)))[1].squeeze(dim=0)
         elif self.emb_type == 'pos_enc':
-            h_enc = self.embeddings['encode_h'](F.selu(self.embeddings['embedding_h'](feats)))  # N 7 512
+            h_enc = self.embeddings['encode_h'](F.elu(self.embeddings['embedding_h'](feats)))  # N 7 512
         else:
             #reshape to have shape (B*V,T*C) [c1,c2,...,c6]
-            h = self.embeddings['embedding_h'](feats)
+            #feats = feats.contiguous().view(feats.shape[0],-1)
+            h_enc = F.elu(self.embeddings['conv_h'](self.embeddings['embedding_h'](feats)) ) #[N,hidds]   
+
         if self.backbone != 'None':
             # Maps feature extraction
             maps_embedding = self.embeddings['map_encoder'](maps)  
             if self.emb_type == 'pos_enc':
-                maps_embedding = maps_embedding.unsqueeze(1).repeat(1,h.shape[1],1)
+                maps_embedding = maps_embedding.unsqueeze(1).repeat(1,h_enc.shape[1],1)
             # Embeddings concatenation
-            h = torch.cat([maps_embedding, h], dim=-1)
+            h = torch.cat([maps_embedding, h_enc], dim=-1)
             h = self.embeddings['linear_cat'](h)
         
         #h = F.relu(h)
@@ -481,17 +478,17 @@ class SCOUT_MTP(nn.Module):
 
 if __name__ == '__main__':
 
-    history_frames = 5
-    future_frames = 12
+    history_frames = 7
+    future_frames = 5
     hidden_dims = 256
-    heads = 2
+    heads = 1
     emb_type = 'emb'
 
-    input_dim = 6 if emb_type != 'emb' else 6*(history_frames) + 3
+    input_dim = 7 if emb_type != 'emb' else 7*(history_frames)
     output_dim = 2*future_frames + 1
 
     model = SCOUT_MTP(input_dim=input_dim, hidden_dim=hidden_dims, emb_dim=512, emb_type=emb_type, output_dim=output_dim, heads=heads,  ew_dims= 2,
-                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='mobilenet', freeze=True)
+                   dropout=0.1, bn=False, feat_drop=0., attn_drop=0., att_ew=True, backbone='resnet50', freeze=True)
     
     #DATAROOT = '/media/14TBDISK/nuscenes'
     #nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   
@@ -502,27 +499,21 @@ if __name__ == '__main__':
     snorm_e = torch.rand(3, 1)
     feats = torch.rand(3, history_frames, 7)
     maps = torch.rand(3, 3, 112, 112)
-    #out = model(feats, e_w,  maps, g)
+    out = model(g, feats, e_w,  maps)
 
-    #desired_shape = (out.shape[0], 3, -1, 2)
-    #trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
+    desired_shape = (out.shape[0], 3, -1, 2)
+    trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
 
     #off_road = utils.OffRoadRate(helper)
-    mtp_loss = MTPLoss(num_modes = 3, regression_loss_weight = 1, angle_threshold_degrees = 5.)
+    
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, retrieve_lanes=True, local_frame=False) 
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_ns)
-
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, challenge_eval=True, local_frame=False) 
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_test)
 
     for batch in test_dataloader:
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps,  scene, tokens, mean_xy, global_feats, lanes, static_feats = batch
-
-        ew = batched_graph.edata['w']#.unsqueeze(1)
-        feats_model = torch.cat((feats.contiguous().view(feats.shape[0],-1), static_feats),dim = -1)
-        pred = model(feats_model, ew, maps, batched_graph)
-        predictions = mtp_loss(pred, feats[:,-1,5], labels_pos[:,:,:2].unsqueeze(1), global_feats[:,history_frames-1,:2].unsqueeze(1).unsqueeze(1), output_masks.unsqueeze(1), 
-                                            False, tokens, lanes, global_feats[:,history_frames-1], test=True)
-                
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, tokens,  scene, mean_xy, maps ,global_feats = batch
+        e_w = batched_graph.edata['w']#.unsqueeze(1)
+        out = model(batched_graph, feats,e_w, maps)
         '''
         desired_shape = (out.shape[0], 3, -1, 2)
         trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape).transpose(0,1)
@@ -530,4 +521,4 @@ if __name__ == '__main__':
             trajectories_no_modes[i] =  convert_local_coords_to_global(mode, global_feats[history_frames-1,:2], global_feats[history_frames-1,2]) + mean_xy
         off_road_output = off_road(trajectories_no_modes, str(tokens[0][1]))
         '''
-        print(predictions.shape)
+        print(out.shape)

@@ -7,7 +7,7 @@ os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 import matplotlib.pyplot as plt
 from torchvision.models import resnet18
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 from torch.utils.data import DataLoader
 from models.MapEncoder import My_MapEncoder
 from models.scout import My_GATLayer, MultiHeadGATLayer, GATConv
@@ -74,11 +74,11 @@ class GAT_VAE(nn.Module):
         if ew_dims > 1:
             self.resize_e = nn.ReplicationPad1d(hidden_dim//2-1)
         if heads == 1:
-            self.gat_1 = GATConv(hidden_dim, hidden_dim, 1, feat_drop, attn_drop, residual=True, activation=F.elu)  
-            #self.gat_1 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2 ,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
+            #self.gat_1 = GATConv(hidden_dim, ew_dims, hidden_dim, 1, feat_drop, attn_drop, residual=True, att_ew=att_ew, activation=F.elu)  
+            self.gat_1 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2 ,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
             if layers>1:
-                self.gat_2 = GATConv(hidden_dim, hidden_dim, 1, feat_drop, attn_drop, residual=True, activation=F.elu) 
-                #self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
+                #self.gat_2 = GATConv(hidden_dim, ew_dims, hidden_dim, 1, feat_drop, attn_drop, residual=True, att_ew=att_ew, activation=F.elu) 
+                self.gat_2 = My_GATLayer(hidden_dim, hidden_dim, e_dims=hidden_dim//2*2, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew) 
         else:
             self.gat_1 = MultiHeadGATLayer(hidden_dim, hidden_dim,  e_dims=hidden_dim//2*2 , res_weight=True, res_connection=True, merge='avg', num_heads=heads,feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew)            
             if layers>1:    
@@ -95,21 +95,26 @@ class GAT_VAE(nn.Module):
         if self.heads > 1:
             nn.init.xavier_normal_(self.embedding_e2.weight)
     
-    def forward(self, g, h,e_w,snorm_n):
+    def forward(self, g, h,e_w):
+        
         if self.ew_dims > 1:
             e = self.resize_e(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e(e_w)
         else:
             e = torch.ones((1, self.hidden_dim), device=h.device) * e_w
         g.edata['w']=e
-        h = self.gat_1(g, h) 
+        
+        h = self.gat_1(g, h, e) 
+        
         if self.layers > 1:
+            
             if self.heads > 1:
                 if self.ew_dims > 1:
                     e = self.resize_e2(torch.unsqueeze(e_w,dim=1)).flatten(start_dim=1) #self.embedding_e2(e_w)
                 else:
                     e = torch.ones((1, self.hidden_dim*self.heads), device=h.device) * e_w
                 g.edata['w']=e
-            h = self.gat_2(g, h) 
+            
+            h = self.gat_2(g, h, e) 
         return h
 
 

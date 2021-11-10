@@ -200,8 +200,8 @@ class MultiHeadGATLayer(nn.Module):
         super(MultiHeadGATLayer, self).__init__()
         self.heads = nn.ModuleList()
         for i in range(num_heads):
-            self.heads.append( GATConv(in_feats, e_dims, out_feats, 1, feat_drop, attn_drop, residual=True, att_ew=att_ew, activation=F.elu) )
-            #self.heads.append(My_GATLayer(in_feats, out_feats, e_dims, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection))
+            #self.heads.append( GATConv(in_feats, e_dims, out_feats, 1, feat_drop, attn_drop, residual=True, att_ew=att_ew, activation=F.elu) )
+            self.heads.append(My_GATLayer(in_feats, out_feats, e_dims, feat_drop=feat_drop, attn_drop=attn_drop, att_ew=att_ew, res_weight=res_weight, res_connection=res_connection))
         self.merge = merge
 
     def forward(self, g, h, e_w):

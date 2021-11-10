@@ -7,7 +7,7 @@ os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 import matplotlib.pyplot as plt
 from torchvision.models import resnet18
-from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch
+from NuScenes.nuscenes_Dataset import nuscenes_Dataset, collate_batch_ns
 from torch.utils.data import DataLoader
 from models.VAE_GNN import MLP_Dec, MLP_Enc
 

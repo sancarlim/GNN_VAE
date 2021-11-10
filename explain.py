@@ -52,8 +52,8 @@ def explain(model, dataloader,mtp_loss,args):
     model.to('cuda:0').eval()
     with torch.no_grad():
         for batch in dataloader:
-            g, output_masks,snorm_n, snorm_e, feats, labels, tokens,  scene, mean_xy, maps ,global_feats = batch
-            if scene == args.scene_id:
+            g, output_masks,snorm_n, snorm_e, feats, labels, tokens,  scene, mean_xy, maps ,global_feats, lanes = batch
+            if scene != args.scene_id:
                 if feats[0][0].any():
                     #ef.inspect(maps, view=ef.View.Image, name=str(scene))
                     #ef.inspect(feats, name='Features')
@@ -65,9 +65,14 @@ def explain(model, dataloader,mtp_loss,args):
                     #ef.inspect(feats, name='Local Features')
                     out = model(feats.to('cuda:0'),e_w.to('cuda:0'), maps.to('cuda:0'), g.to('cuda:0'))
                     
-                    pred = mtp_loss(out, feats[:,5,5], global_feats[:,history_frames:,:2].to('cuda:0').unsqueeze(1), last_loc.unsqueeze(1), output_masks.to('cuda:0').unsqueeze(1), 
-                                    hparams.local_frame, tokens[:,-1], tokens[:,-2], global_feats[:,history_frames-1].to('cuda:0'))
+                    avg_loss, regression_avg_loss, class_avg_loss = mtp_loss(out, feats[:,5,5], global_feats[:,history_frames:,:2].to('cuda:0').unsqueeze(1), last_loc.unsqueeze(1), output_masks.to('cuda:0').unsqueeze(1), 
+                                    hparams.local_frame, tokens, None, global_feats[:,history_frames-1].to('cuda:0'))
 
+                    avg_loss_2, regression_avg_loss_2, class_avg_loss = mtp_loss(out, feats[:,5,5], global_feats[:,history_frames:,:2].to('cuda:0').unsqueeze(1), last_loc.unsqueeze(1), output_masks.to('cuda:0').unsqueeze(1), 
+                                    hparams.local_frame, tokens, lanes, global_feats[:,history_frames-1].to('cuda:0'))
+                    
+                    print(avg_loss, avg_loss_2)
+        '''
                     pred = torch.argmax(out[:,-3:], dim=1)  #max prob
                     targets = 18 * (pred + 1) + pred*3  #18 39 60
                     attribution = dl.attribute((feats, e_w), additional_forward_args=(maps, g, True), target=targets) #target de los 63 outputs si 3 modes (20*3 + 3), 18 es x de mode 1 t=5s
@@ -79,7 +84,7 @@ def explain(model, dataloader,mtp_loss,args):
                     ef.inspect(attribution[0], name='attribution FEATS deepLift')
                     ef.inspect(attribution[1], name='attribution EDGES deepLift')
                     ef.inspect(attr_feat_perm, name='attribution feature permutation', wait=True )
-        '''
+        #''
         out = model(feats, e_w,  maps, g, attr=False)
         trajectories_no_modes = out[:, :-3].clone().reshape(desired_shape)
         # we use the first 100 training examples as our background dataset to integrate over
@@ -95,7 +100,7 @@ def explain(model, dataloader,mtp_loss,args):
 def main(args: Namespace):
     print(args)
 
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, 
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, 
                                     challenge_eval=True, local_frame = args.local_frame)  #230
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_test)
     input_dim_model =  7 * (history_frames-1)#Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
