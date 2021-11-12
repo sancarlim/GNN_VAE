@@ -324,8 +324,6 @@ class MTPLoss:
             best_mode = torch.argmin(losses, dim=0)
 
         best_trajs = trajectories[torch.arange(targets.shape[0]),best_mode]*mask.squeeze(1)
-        if val_test == 'test':
-            return best_trajs
 
         regression_loss = f.smooth_l1_loss(best_trajs, targets.squeeze())
         #  torch.sum(torch.where(torch.abs(targets.squeeze()-best_trajs) < delta , (0.5*(targets.squeeze()-best_trajs)**2), torch.abs(targets.squeeze() - best_trajs)*delta - 0.5*(delta**2)), dim=-1) 
@@ -337,9 +335,9 @@ class MTPLoss:
 
             off_road_rate = 0 #self.off_road_loss(best_trajs,  tokens[:,-1])
             return classification_loss + self.regression_loss_weight * regression_loss + self.offroad_loss_weight * off_road_rate, regression_loss, classification_loss, off_road_rate
-        
-        else:   
-
+        elif val_test == 'test':
+            return best_trajs
+        else: 
             if lanes != -1:
                 trajectories_lanes = torch.cuda.FloatTensor(self.get_lane_pos(current_sample=tokens[:,1], trajectories = trajectories, 
                                     current_angle = global_feats[:,2], instance_lanes = lanes)) #current_lane = tokens[batch_idx,-2]

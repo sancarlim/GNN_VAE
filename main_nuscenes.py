@@ -319,11 +319,11 @@ class LitGNN(pl.LightningModule):
 
 
     def test_step(self, test_batch, batch_idx):
-        batched_graph, output_masks,snorm_n, snorm_e, feats, labels, maps, scene, tokens,mean_xy, global_feats, lanes, static_feats = test_batch
+        batched_graph, output_masks,snorm_n, snorm_e, feats, labels_pos, maps, scene, tokens,mean_xy, global_feats, lanes, static_feats = test_batch
 
         last_loc = feats[:,-1:,:2].detach().clone() if not hparams.local_frame else torch.zeros((feats.shape[0], 1, 2), device='cuda')
 
-        feats_vel, labels_vel = compute_change_pos(feats, labels[:,:,:2], hparams.local_frame)    
+        feats_vel, labels = compute_change_pos(feats, labels_pos[:,:,:2], hparams.local_frame)    
         if hparams.feats_deltas and not hparams.local_frame:
             feats = torch.cat([feats_vel, feats[:,:,2:]], dim=-1) if hparams.local_frame else torch.cat([feats_vel, feats[:,:,2:]], dim=-1)[:,1:]
         
@@ -357,8 +357,8 @@ class LitGNN(pl.LightningModule):
             '''
             if hparams.model_type == 'mtp':
 
-                pred, _, _ = self.mtp_loss(pred, feats[:,-1,5], labels[:,:,:2].unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1), 
-                                                hparams.local_frame, tokens, lanes, global_feats[:,self.history_frames-1], val_test='test')
+                pred = self.mtp_loss(pred, feats[:,-1,5], labels_pos.unsqueeze(1), last_loc.unsqueeze(1), output_masks.unsqueeze(1), 
+                                                hparams.local_frame, tokens, lanes, global_feats[:,self.history_frames-1], val_test='test') 
 
                 # for j in range(1,labels.shape[-2]):
                 #     pred[:,:,j,:] = torch.sum(pred[:,:,j-1:j+1,:],dim=-2) 
@@ -371,11 +371,11 @@ class LitGNN(pl.LightningModule):
                 # for pred_i in pred:
                 #     ade2, fde_error, overall_num2, fde_num, x2y2_error2 = self.compute_RMSE_batch(pred_i, labels, output_masks)
             else:
-                pred=pred.view(labels.shape[0],self.future_frames,-1)
-                for i in range(1,labels.shape[1]):
+                pred=pred.view(labels_pos.shape[0],self.future_frames,-1)
+                for i in range(1,labels_pos.shape[1]):
                     pred[:,i,:] = torch.sum(pred[:,i-1:i+1,:],dim=-2) #BV,6,2 
                 pred += last_loc
-                ade_error, fde_error, overall_num, fde_num, x2y2_error = self.compute_RMSE_batch(pred, labels[:,:,:2], output_masks)
+                ade_error, fde_error, overall_num, fde_num, x2y2_error = self.compute_RMSE_batch(pred, labels_pos[:,:,:2], output_masks)
 
         if self.probabilistic:
             ade = []
@@ -544,7 +544,7 @@ def main(args: Namespace):
         checkpoint_callback = ModelCheckpoint(monitor='Sweep/val_rmse_loss', mode='min',  dirpath=args.ckpt.split('.')[0] + '_resume.ckpt')
         logger = None if args.nowandb else wandb_logger
         trainer = pl.Trainer(resume_from_checkpoint=args.ckpt, weights_summary='full',  logger=logger, gpus=args.gpus, deterministic=True, precision=32, callbacks=[early_stop_callback,checkpoint_callback]) 
-        trainer.fit(LitGNN_sys)
+        #trainer.fit(LitGNN_sys)
         
         print('############ TEST  ##############')
         trainer = pl.Trainer(gpus=1, profiler='simple')
