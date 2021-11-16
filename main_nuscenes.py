@@ -476,13 +476,13 @@ def main(args: Namespace):
     else:
         history_frames = args.history_frames
         future_frames = 12 if history_frames == 5 else 10
-        train_dataset = nuscenes_Dataset( train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, local_frame = args.local_frame, retrieve_lanes=hparams.retrieve_lanes, step=args.step) #3447
-        #val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames)  #919
-        test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, local_frame = args.local_frame, retrieve_lanes=hparams.retrieve_lanes, step=args.step)  #230
+        train_dataset = nuscenes_Dataset( train_val_test='train',  rel_types=args.ew_dims>1, history_frames=history_frames, local_frame = args.local_frame, retrieve_lanes=hparams.retrieve_lanes, step=args.step) #3447
+        #val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames)  #919
+        test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=history_frames, local_frame = args.local_frame, retrieve_lanes=hparams.retrieve_lanes, step=args.step)  #230
         input_dim = 6
         
         
-    input_dim_model = input_dim*(history_frames-1) +3 if args.local_frame or args.feats_deltas else input_dim * history_frames +3
+    input_dim_model = input_dim*(history_frames) +3 if args.local_frame or args.feats_deltas else input_dim * history_frames +3
     output_dim = (2*future_frames+ 1) if args.model_type == 'mtp' else 2*future_frames
 
     if args.model_type == 'gat_mdn':

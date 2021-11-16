@@ -1,5 +1,3 @@
-
-import dgl
 import torch
 from torch.utils.data import DataLoader
 import os
@@ -252,7 +250,7 @@ class LitGNN(pl.LightningModule):
                 lane = tokens_eval[idx,-2]
                 if category[0] == 'vehicle':
                     #angles = [ MTPLoss._angle_wrt_x(trajectory, global_feats[idx,2]) for trajectory in prediction]
-                    traj_lanes = MTPLoss.get_lane_pos(current_sample=tokens_eval[idx,1], trajectories = prediction, current_angle = global_feats[idx,2], instance_lanes = lanes[tokens_eval[idx,1]][tokens_eval[idx,0]]) 
+                    traj_lanes = MTPLoss._get_lane_pos(current_sample=tokens_eval[idx,1], trajectories = prediction, current_angle = global_feats[idx,2], instance_lanes = lanes[tokens_eval[idx,1]][tokens_eval[idx,0]]) 
             
             else:
                 prediction = prediction_all_agents[:,idx, :]
@@ -450,7 +448,7 @@ class LitGNN(pl.LightningModule):
 def main(args: Namespace):
     print(args)
 
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, 
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, 
                                     local_frame = args.local_frame, retrieve_lanes=True, test=True)  #230
 
     if args.model_type == 'vae_gated':

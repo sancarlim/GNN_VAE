@@ -34,11 +34,11 @@ mapping_dict = {
         }
     
 #scene = nuscenes.field2token('scene', 'name','scene-0276')[0]
-now_history_frame = 4
+now_history_frame = 8
 #nusc_map = NuScenesMap(map_name = nuscenes.get('log', scene['log_token'])['location'], dataroot=DATAROOT)
 
-for data_class in ['train']:
-    data_dir = os.path.join(base_path, 'ns_2s6s_' + data_class + '.pkl')
+for data_class in ['val']:
+    data_dir = os.path.join(base_path, 'ns_4s_' + data_class + '.pkl')
     with open(data_dir, 'rb') as reader:
         [all_feature, all_adjacency, all_mean_xy, all_tokens]= pkl.load(reader)
 
@@ -130,16 +130,21 @@ for data_class in ['train']:
     print(f'Processed {all_feature.shape[0]} sequences.')
     '''
     
-    
     #lanes = {}
     for idx, seq_tokens in enumerate(all_tokens): 
         # Retrieve ego_vehicle pose
         sample_token = seq_tokens[0,1]
-        with open(os.path.join(base_path_map, sample_token + '.pkl'), 'rb') as reader:
-            maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
+        try:
+            with open(os.path.join(base_path_map, sample_token + '.pkl'), 'rb') as reader:
+                maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
+        ### IF no map for this sample token ####
+        except:
+            print(f'Sample {sample_token} has no map. Adding it to the folder ...')
+
+        #### IF agents in map don't match agents in sequence ### 
+        #if len(seq_tokens) != len(maps):
+        #    print(f'{idx}: maps {len(maps)}, agents {len(seq_tokens)}')
         
-        if len(seq_tokens) != len(maps):
-            print(f'{idx}: maps {len(maps)}, agents {len(seq_tokens)}')
             sample_record = nuscenes.get('sample', sample_token)     
             sample_data_record = nuscenes.get('sample_data', sample_record['data']['LIDAR_TOP'])
             poserecord = nuscenes.get('ego_pose', sample_data_record['ego_pose_token'])
