@@ -32,16 +32,13 @@ from scipy.ndimage import rotate
 
 FREQUENCY = 2
 history = 2
-future = 6
+future = 5
 history_frames = history*FREQUENCY + 1
 future_frames = future*FREQUENCY
 input_dim_model = (history_frames-1)*7 #Input features to the model: x,y-global (zero-centralized), heading,vel, accel, heading_rate, type 
 output_dim = future_frames*2 +1
 base_path='/media/14TBDISK/sandra/nuscenes_processed'
 DATAROOT = '/media/14TBDISK/nuscenes'
-nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
-
-helper = PredictHelper(nuscenes)
 
 layers = ['drivable_area',
           'road_segment',
@@ -79,7 +76,6 @@ class LitGNN(pl.LightningModule):
         self.model= model
         self.history_frames =history_frames
         self.future_frames = future_frames
-        self.total_frames = history_frames + future_frames
         self.test_dataset = test_dataset
         self.rel_types = rel_types
         self.scale_factor = scale_factor
@@ -238,7 +234,7 @@ class LitGNN(pl.LightningModule):
             category = annotation['category_name'].split('.')
             attribute = nuscenes.get('attribute', annotation['attribute_tokens'][0])['name'].split('.')[1]
             
-            history = global_feats[idx,:self.history_frames,:2].cpu().numpy() * output_masks[idx, :history_frames].cpu().numpy()
+            history = global_feats[idx,:self.history_frames,:2].cpu().numpy() * output_masks[idx, :self.history_frames].cpu().numpy()
             
             
             if self.model_type == 'mtp':
@@ -264,7 +260,7 @@ class LitGNN(pl.LightningModule):
             
             #remove zero rows (no data in those frames) and rescale to obtain global coords.
             history = history[history.all(axis=1)] 
-            future = global_feats[idx, self.history_frames:, :2].cpu().numpy() * output_masks[idx, history_frames:].cpu().numpy() #labels_pos[idx].cpu().numpy()
+            future = global_feats[idx, self.history_frames:, :2].cpu().numpy() * output_masks[idx, self.history_frames:].cpu().numpy() #labels_pos[idx].cpu().numpy()
             future = future[future.all(axis=1)] 
             if history.shape[0] < 2:
                 if history.shape[0] == 0:
@@ -448,8 +444,8 @@ class LitGNN(pl.LightningModule):
 def main(args: Namespace):
     print(args)
 
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=history_frames, 
-                                    local_frame = args.local_frame, retrieve_lanes=True, test=True)  #230
+    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=args.history_frames, 
+                                    local_frame = args.local_frame, retrieve_lanes=True, step=3, test=True)  #230
 
     if args.model_type == 'vae_gated':
         model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
@@ -458,26 +454,26 @@ def main(args: Namespace):
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, 
                         ew_dims=args.ew_dims, backbone=args.backbone)
     elif args.model_type == 'vae_prior':
-        input_dim_model =  7 * (history_frames-1) if args.enc_type == 'emb' else 7
+        input_dim_model =  7 * (args.history_frames-1) if args.enc_type == 'emb' else 7
         model = VAE_GNN_prior(input_dim_model, args.hidden_dims, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
                         attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'), encoding_type=args.enc_type)
     elif args.model_type == 'mtp':
-        input_dim_model = 6 * (history_frames-1) + 3 if args.emb_type == 'emb' else 7
+        input_dim_model = 6 * (args.history_frames) + 3 if args.emb_type == 'emb' else 7
         model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, emb_dim=args.emb_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone,
-                        num_modes = args.num_modes, history_frames=history_frames-1)
+                        num_modes = args.num_modes, history_frames=args.history_frames-1)
     else:
         model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
                         feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
     
 
-    LitGNN_sys = LitGNN(model=model,  model_type = args.model_type,history_frames=history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
+    LitGNN_sys = LitGNN(model=model,  model_type = args.model_type,history_frames=args.history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
                  test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id)
       
     trainer = pl.Trainer(gpus=1, deterministic=True) 
  
-    LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=history_frames, future_frames= future_frames,
+    LitGNN_sys = LitGNN.load_from_checkpoint(checkpoint_path=args.ckpt, model=LitGNN_sys.model, model_type = args.model_type, history_frames=args.history_frames, future_frames= future_frames,
                     train_dataset=None, val_dataset=None, test_dataset=test_dataset, rel_types=args.ew_dims>1, scale_factor=args.scale_factor, scene_id=args.scene_id, sample = args.sample,
                     ckpt = args.ckpt)
 
@@ -488,7 +484,6 @@ def main(args: Namespace):
 if __name__ == '__main__':
 
     parser = ArgumentParser()
-    parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--scale_factor", type=int, default=1, help="Wether to scale x,y global positions (zero-centralized)")
     parser.add_argument("--ew_dims", type=int, default=2, choices=[1,2], help="Edge features: 1 for relative position, 2 for adding relationship type.")
     parser.add_argument("--z_dims", type=int, default=128, help="Dimensionality of the latent space")
@@ -508,14 +503,20 @@ if __name__ == '__main__':
     parser.add_argument('--maps', type=str2bool, nargs='?', const=True, default=True, help="Add HD Maps.")
     parser.add_argument('--local_frame',  type=str2bool, nargs='?', const=True, default=True, help='whether to use local or global features.')  
     parser.add_argument("--emb_type", type=str, default='emb', choices=['emb', 'pos_enc', 'gru'])
-    parser.add_argument('--num_modes', type=int, default=10, help="Number of decodings in training.")
-    parser.add_argument("--backbone", type=str, default='resnet34', help="Choose CNN backbone.",
+    parser.add_argument('--num_modes', type=int, default=3, help="Number of decodings in training.")
+    parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'resnet34', 'mobilenet', 'resnet18','resnet50', 'map_encoder'])
     parser.add_argument("--scene_id", type=int, default=700, help="Scene id to visualize.")
     parser.add_argument("--sample", type=str, default=None, help="sample to visualize.")
     parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')      
     parser.add_argument('--feats_deltas',  type=str2bool, nargs='?', const=True, default=True, help='whether to use position deltas as features.')  
+    parser.add_argument("--history_frames", type=int, default=9)
     hparams = parser.parse_args()
+
+
+    nuscenes = NuScenes('v1.0-trainval', dataroot=DATAROOT)   #850 scenes
+
+    helper = PredictHelper(nuscenes)
 
     main(hparams)
 
