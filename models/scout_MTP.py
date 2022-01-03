@@ -481,7 +481,7 @@ class SCOUT_MTP(nn.Module):
 
 if __name__ == '__main__':
 
-    history_frames = 5
+    history_frames = 9
     future_frames = 12
     hidden_dims = 256
     heads = 2
@@ -510,7 +510,7 @@ if __name__ == '__main__':
     #off_road = utils.OffRoadRate(helper)
     mtp_loss = MTPLoss(num_modes = 3, regression_loss_weight = 1, angle_threshold_degrees = 5.)
     #summary(model.feature_extractor, input_size=(1,112,112), device='cpu')
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, future_frames=future_frames, retrieve_lanes=True, local_frame=False) 
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=True, history_frames=history_frames, retrieve_lanes=False, local_frame=True) 
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False,  collate_fn=collate_batch_ns)
 
 

@@ -176,3 +176,14 @@ core
 *.tar.gz
 *.avi
 *.zip
+efemarai_scan_2021_06_21_14_56_51_720.efm
+inf_values_detected.efm
+NuScenes/data/cifar-10-batches-py/batches.meta
+NuScenes/data/cifar-10-batches-py/data_batch_1
+NuScenes/data/cifar-10-batches-py/data_batch_2
+NuScenes/data/cifar-10-batches-py/data_batch_3
+NuScenes/data/cifar-10-batches-py/data_batch_4
+NuScenes/data/cifar-10-batches-py/data_batch_5
+NuScenes/data/cifar-10-batches-py/readme.html
+NuScenes/data/cifar-10-batches-py/test_batch
+SyntheticDataset/synthetic.py
