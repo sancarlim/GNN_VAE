@@ -11,7 +11,6 @@ import sys
 
 from nuscenes import prediction
 
-sys.path.append('..')
 os.environ['DGLBACKEND'] = 'pytorch'
 import numpy as np
 from ApolloScape_Dataset import ApolloScape_DGLDataset
