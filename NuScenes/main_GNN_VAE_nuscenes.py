@@ -344,9 +344,9 @@ def main(args: Namespace):
     
     future_frames = 12 if args.history_frames == 5 else 10
     output_dim = future_frames*2 + 1
-    train_dataset = nuscenes_Dataset(train_val_test='train',  rel_types=args.ew_dims>1, history_frames=args.history_frames, future_frames=future_frames, local_frame = args.local_frame, retrieve_lanes=False) #3447
+    train_dataset = nuscenes_Dataset(train_val_test='train',  rel_types=args.ew_dims>1, history_frames=args.history_frames, local_frame = args.local_frame, retrieve_lanes=False) #3447
     #val_dataset = nuscenes_Dataset(train_val_test='val',  rel_types=args.ew_dims>1, history_frames=history_frames, future_frames=future_frames, local_frame = args.local_frame)  #919
-    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=args.history_frames, future_frames=future_frames, local_frame = args.local_frame, retrieve_lanes=False)  #230
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=args.history_frames, local_frame = args.local_frame, retrieve_lanes=False)  #230
 
     '''
     if args.ckpt is not None:

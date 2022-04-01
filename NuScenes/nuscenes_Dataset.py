@@ -277,11 +277,6 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
             maps = pickle.load(reader)  # [N_agents][3, 112,112] list of tensors
         maps=torch.vstack([self.transform(map_i).unsqueeze(0) for map_i in maps])
 
-        if maps.shape[0] != feats.shape[0]:
-            print('hey')
-        if sample_token=='d828eee107fd4fa7b727946e6262fdad':
-            print('stop)')
-
         ### Load tokens: instance, sample, location, current lane
         tokens = self.all_tokens[idx]
 
@@ -321,7 +316,7 @@ class nuscenes_Dataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     
-    train_dataset = nuscenes_Dataset(train_val_test='train', local_frame=True, retrieve_lanes=False, history_frames=9, step=1)  #3509
+    train_dataset = nuscenes_Dataset(train_val_test='test', local_frame=True, retrieve_lanes=False, history_frames=9, step=1)  #3509
     #train_dataset = nuscenes_Dataset(train_val_test='train', challenge_eval=False)  #3509
     #test_dataset = nuscenes_Dataset(train_val_test='test', challenge_eval=True)  #1754
     test_dataloader=iter(DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=collate_batch_ns) )

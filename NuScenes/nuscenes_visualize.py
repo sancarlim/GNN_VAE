@@ -172,7 +172,7 @@ class LitGNN(pl.LightningModule):
                 pred_y = preds[:,:,1].cpu().numpy() + mean_xy[0][1]
                 
                 prediction_all_agents.append(np.stack([pred_x, pred_y],axis=-1))
-            prediction_all_agents = np.array(prediction_all_agents)  
+                prediction_all_agents = np.array(prediction_all_agents)
         
         
 
@@ -327,6 +327,7 @@ class LitGNN(pl.LightningModule):
 
             
             # Plot predictions
+            prediction = [prediction_i.cpu() for prediction_i in prediction]
             if category[0] != 'vehicle':
                 if 'sitting_lying_down' not in attribute:
                     if self.model_type == 'scout':
@@ -444,28 +445,26 @@ class LitGNN(pl.LightningModule):
 def main(args: Namespace):
     print(args)
 
-    test_dataset = nuscenes_Dataset(train_val_test='train', rel_types=args.ew_dims>1, history_frames=args.history_frames, 
-                                    local_frame = args.local_frame, retrieve_lanes=True, step=3, test=True)  #230
+    test_dataset = nuscenes_Dataset(train_val_test='test', rel_types=args.ew_dims>1, history_frames=args.history_frames, 
+                                    local_frame = args.local_frame, retrieve_lanes=True, step=4, test=True)  #230
 
     if args.model_type == 'vae_gated':
-        model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False, dropout=args.dropout,  ew_dims=args.ew_dims)
+        model = VAE_GATED(input_dim_model, args.hidden_dims, z_dim=args.z_dims, output_dim=output_dim, fc=False,  ew_dims=args.ew_dims)
     elif  args.model_type == 'vae_gat':
-        model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, 
-                        ew_dims=args.ew_dims, backbone=args.backbone)
+        model = VAE_GNN(input_dim_model, args.hidden_dims//args.heads, args.z_dims, output_dim, fc=False, 
+                             heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone)
     elif args.model_type == 'vae_prior':
         input_dim_model =  7 * (args.history_frames-1) if args.enc_type == 'emb' else 7
-        model = VAE_GNN_prior(input_dim_model, args.hidden_dims, args.z_dims, output_dim, fc=False, dropout=args.dropout, feat_drop=args.feat_drop,
-                        attn_drop=args.attn_drop, heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
+        model = VAE_GNN_prior(input_dim_model, args.hidden_dims, args.z_dims, output_dim, fc=False, 
+                                heads=args.heads, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, freeze=args.freeze,
                         bn=(args.norm=='bn'), gn=(args.norm=='gn'), encoding_type=args.enc_type)
     elif args.model_type == 'mtp':
         input_dim_model = 6 * (args.history_frames) + 3 if args.emb_type == 'emb' else 7
-        model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, emb_dim=args.emb_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone,
-                        num_modes = args.num_modes, history_frames=args.history_frames-1)
+        model = SCOUT_MTP(input_dim=input_dim_model, hidden_dim=args.hidden_dims, emb_dim=args.emb_dims, output_dim=output_dim, heads=args.heads, 
+                        att_ew=args.att_ew, ew_dims=args.ew_dims, backbone=args.backbone, num_modes = args.num_modes, history_frames=args.history_frames-1)
     else:
-        model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, dropout=args.dropout, 
-                        feat_drop=args.feat_drop, attn_drop=args.attn_drop, att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
+        model = SCOUT(input_dim=input_dim_model, hidden_dim=args.hidden_dims, output_dim=output_dim, heads=args.heads, 
+                         att_ew=args.att_ew, ew_dims=args.ew_dims>1, backbone=args.backbone)
     
 
     LitGNN_sys = LitGNN(model=model,  model_type = args.model_type,history_frames=args.history_frames, future_frames= future_frames, train_dataset=None, val_dataset=None,
@@ -489,10 +488,7 @@ if __name__ == '__main__':
     parser.add_argument("--z_dims", type=int, default=128, help="Dimensionality of the latent space")
     parser.add_argument("--hidden_dims", type=int, default=768)
     parser.add_argument("--model_type", type=str, default='mtp', help="Choose aggregation function between GAT or GATED",
-                                        choices=['vae_gat', 'vae_gated', 'vae_prior', 'scout', 'mtp'])
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--feat_drop", type=float, default=0.)
-    parser.add_argument("--attn_drop", type=float, default=0.4)
+                                        choices=['vae_gat', 'vae_gated', 'vae_prior', 'scout', 'mtp']) 
     parser.add_argument("--heads", type=int, default=1, help='Attention heads (GAT)')
     parser.add_argument('--att_ew', type=str2bool, nargs='?', const=True, default=True, help="Add edge features in attention function (GAT)")
     parser.add_argument('--ckpt', type=str, default='/media/14TBDISK/sandra/logs/dainty-durian-12629/epoch=25-step=3769.ckpt', help='ckpt path.')  
@@ -507,8 +503,7 @@ if __name__ == '__main__':
     parser.add_argument("--backbone", type=str, default='resnet50', help="Choose CNN backbone.",
                                         choices=['resnet_gray', 'resnet34', 'mobilenet', 'resnet18','resnet50', 'map_encoder'])
     parser.add_argument("--scene_id", type=int, default=700, help="Scene id to visualize.")
-    parser.add_argument("--sample", type=str, default=None, help="sample to visualize.")
-    parser.add_argument('--nowandb', action='store_true', help='use this flag to DISABLE wandb logging')      
+    parser.add_argument("--sample", type=str, default=None, help="sample to visualize.") 
     parser.add_argument('--feats_deltas',  type=str2bool, nargs='?', const=True, default=True, help='whether to use position deltas as features.')  
     parser.add_argument("--history_frames", type=int, default=9)
     hparams = parser.parse_args()
